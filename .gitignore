@@ -1,0 +1,22 @@
+# Build outputs
+*.exe
+*.dll
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# CUDA / compiler intermediates
+*.cudafe*
+*.ptx
+*.cubin
+*.fatbin
+
+# Local editor / OS files
+.vs/
+.vscode/
+*.user
+desktop.ini
+
