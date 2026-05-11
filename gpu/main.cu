@@ -282,33 +282,36 @@ static void draw_velocity_field(const float *u, const float *v) {
     if (stride < 4) stride = 4;
     float spacing = stride * h;
 
-    glPointSize(3.0f);
-    glColor3f(0.0f, 0.75f, 0.10f);
-    glBegin(GL_POINTS);
-    for (int i = stride / 2 + 1; i <= N; i += stride) {
-        float x = (i - 0.5f) * h;
-        for (int j = stride / 2 + 1; j <= N; j += stride) {
-            float y = (j - 0.5f) * h;
-            glVertex2f(x, y);
-        }
-    }
-    glEnd();
-    glPointSize(1.0f);
-
     glLineWidth(1.5f);
     glBegin(GL_LINES);
     for (int i = stride / 2 + 1; i <= N; i += stride) {
         float x = (i - 0.5f) * h;
         for (int j = stride / 2 + 1; j <= N; j += stride) {
             float y = (j - 0.5f) * h;
-            float vx = u[IX(i, j)];
-            float vy = v[IX(i, j)];
+            float vx = 0.0f;
+            float vy = 0.0f;
+            int count = 0;
+            int half = stride / 2;
+            for (int jj = j - half; jj <= j + half; jj++) {
+                if (jj < 1 || jj > N) continue;
+                for (int ii = i - half; ii <= i + half; ii++) {
+                    if (ii < 1 || ii > N) continue;
+                    vx += u[IX(ii, jj)];
+                    vy += v[IX(ii, jj)];
+                    count++;
+                }
+            }
+            if (count > 0) {
+                vx /= (float)count;
+                vy /= (float)count;
+            }
+
             float speed = sqrtf(vx * vx + vy * vy);
-            if (speed < 0.01f) continue;
+            if (speed < 0.0005f) continue;
 
             float magnitude = speed * velocity_vis_scale;
-            if (magnitude > 0.85f) magnitude = 0.85f;
-            float len = spacing * magnitude;
+            if (magnitude > 0.75f) magnitude = 0.75f;
+            float len = spacing * (0.15f + magnitude);
             float dir_x = vx / speed;
             float dir_y = vy / speed;
             float end_x = x + dir_x * len;
