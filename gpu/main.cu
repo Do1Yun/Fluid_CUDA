@@ -46,6 +46,7 @@ static float force  = 5.0f;
 static float source = 100.0f;
 static int brush_cells_divisor = 64;
 static float velocity_vis_scale = 0.25f;
+static int velocity_arrow_divisor = 32;
 
 static float *h_u, *h_v, *h_u_prev, *h_v_prev;
 static float *h_dens, *h_dens_prev;
@@ -277,19 +278,50 @@ static void draw_density_field(const float *dens) {
 
 static void draw_velocity_field(const float *u, const float *v) {
     float h = 1.0f / N;
-    glColor3f(0.0f, 1.0f, 0.0f);
-    glLineWidth(1.0f);
+    int stride = N / velocity_arrow_divisor;
+    if (stride < 4) stride = 4;
+    float spacing = stride * h;
+
+    glLineWidth(1.5f);
     glBegin(GL_LINES);
-    for (int i = 1; i <= N; i++) {
+    for (int i = stride / 2 + 1; i <= N; i += stride) {
         float x = (i - 0.5f) * h;
-        for (int j = 1; j <= N; j++) {
+        for (int j = stride / 2 + 1; j <= N; j += stride) {
             float y = (j - 0.5f) * h;
+            float vx = u[IX(i, j)];
+            float vy = v[IX(i, j)];
+            float speed = sqrtf(vx * vx + vy * vy);
+            if (speed < 0.01f) continue;
+
+            float magnitude = speed * velocity_vis_scale;
+            if (magnitude > 0.85f) magnitude = 0.85f;
+            float len = spacing * magnitude;
+            float dir_x = vx / speed;
+            float dir_y = vy / speed;
+            float end_x = x + dir_x * len;
+            float end_y = y + dir_y * len;
+            float head_len = len * 0.30f;
+            float head_w = len * 0.18f;
+            float px = -dir_y;
+            float py = dir_x;
+            float intensity = speed * 0.20f;
+            if (intensity > 1.0f) intensity = 1.0f;
+
+            glColor3f(0.15f + 0.85f * intensity, 1.0f, 0.15f);
             glVertex2f(x, y);
-            glVertex2f(x + velocity_vis_scale * h * u[IX(i, j)],
-                       y + velocity_vis_scale * h * v[IX(i, j)]);
+            glVertex2f(end_x, end_y);
+
+            glVertex2f(end_x, end_y);
+            glVertex2f(end_x - dir_x * head_len + px * head_w,
+                       end_y - dir_y * head_len + py * head_w);
+
+            glVertex2f(end_x, end_y);
+            glVertex2f(end_x - dir_x * head_len - px * head_w,
+                       end_y - dir_y * head_len - py * head_w);
         }
     }
     glEnd();
+    glLineWidth(1.0f);
 }
 
 static void draw_text(float x, float y, const char *str) {
