@@ -1,99 +1,87 @@
 # Fluid CUDA
 
-2D fluid simulation experiments based on Jos Stam's **Stable Fluids** method from
-"Real-Time Fluid Dynamics for Games" (GDC 2003).
+Jos Stam의 **Stable Fluids** 방법을 기반으로 만든 2D 유체 시뮬레이션 실험 프로젝트입니다.
 
-The repository contains separate CPU and CUDA GPU viewers so each version can be
-compiled, executed, and profiled independently.
+CPU 버전과 CUDA GPU 버전을 분리해 두었기 때문에, 두 구현을 각각 따로 컴파일하고 실행하면서 성능을 비교할 수 있습니다.
 
-## Theoretical Background
+## 이론적 배경
 
-This project simulates smoke-like fluid motion on a regular 2D grid. The visible
-smoke is represented by a scalar **density field**, and the flow is represented
-by a 2D **velocity field** `(u, v)`.
+이 프로젝트는 2D 격자 위에서 연기처럼 보이는 유체의 움직임을 시뮬레이션합니다. 화면에 보이는 연기는 스칼라 값인 **밀도장(density field)** 으로 표현하고, 흐름은 각 격자점의 2차원 **속도장(velocity field)** `(u, v)`로 표현합니다.
 
-The solver follows the incompressible Navier-Stokes model:
+기본적으로는 비압축성 Navier-Stokes 방정식의 흐름을 따릅니다.
 
 ```text
-velocity change = external force + diffusion + advection + projection
-density change  = source injection + diffusion + advection + dissipation
+속도 변화 = 외력 + 확산 + 이류 + 투영
+밀도 변화 = 밀도 주입 + 확산 + 이류 + 감쇠
 ```
 
-The main steps are:
+시뮬레이션은 주로 다음 단계들로 이루어집니다.
 
-| Step | Meaning |
-|------|---------|
-| Source | Add smoke density or velocity from the mouse/automatic emitter |
-| Diffusion | Spread density or velocity to nearby cells |
-| Advection | Move density/velocity along the current velocity field |
-| Projection | Remove divergence so the velocity field behaves incompressibly |
-| Dissipation | Gradually fade smoke and damp velocity |
+| 단계 | 의미 |
+|------|------|
+| Source | 마우스 입력 또는 자동 발생기로 밀도/속도를 추가 |
+| Diffusion | 밀도나 속도가 주변 격자로 퍼지는 과정 |
+| Advection | 현재 속도장을 따라 밀도와 속도가 이동하는 과정 |
+| Projection | 속도장의 발산을 줄여 비압축성 유체처럼 보이게 만드는 과정 |
+| Dissipation | 연기와 속도가 시간이 지나며 서서히 사라지게 하는 감쇠 |
 
-The key idea of Stable Fluids is that it prioritizes visual stability over strict
-physical exactness. Instead of using an unstable forward particle-style update,
-it traces values backward through the velocity field during advection. This is
-called **semi-Lagrangian advection**, and it lets the simulation run with larger
-time steps without exploding numerically.
+Stable Fluids의 핵심은 물리적으로 완벽한 정확도보다 **시각적으로 안정적인 시뮬레이션**을 우선한다는 점입니다. 일반적인 전진 방식 업데이트는 시간 간격이 커지면 쉽게 불안정해질 수 있습니다. 반면 이 방법은 이류 단계에서 현재 위치의 값이 어디에서 흘러왔는지를 거꾸로 추적합니다. 이를 **semi-Lagrangian advection**이라고 하며, 비교적 큰 시간 간격에서도 시뮬레이션이 폭발하지 않도록 도와줍니다.
 
-For pressure projection, the solver uses iterative Jacobi relaxation. This makes
-the velocity field approximately divergence-free, which prevents the fluid from
-visually expanding or compressing like a gas being created from nowhere.
+또한 투영 단계에서는 Jacobi 반복법을 사용해 압력장을 근사적으로 구하고, 그 압력장을 이용해 속도장의 발산을 줄입니다. 이 과정 덕분에 유체가 갑자기 부풀거나 줄어드는 것처럼 보이지 않고, 비압축성 유체에 가까운 움직임을 갖게 됩니다.
 
-## CPU vs GPU Version
+## CPU 버전과 GPU 버전
 
-The CPU version performs the full simulation with ordinary C++ loops. It is useful
-as a readable baseline.
+CPU 버전은 모든 계산을 일반 C++ 반복문으로 수행합니다. 구조가 비교적 직관적이기 때문에 기준 구현으로 보기 좋습니다.
 
-The GPU version moves the simulation kernels to CUDA. Each grid cell can be
-updated in parallel, which makes advection, diffusion, projection, and damping
-good candidates for GPU acceleration.
+GPU 버전은 주요 시뮬레이션 단계를 CUDA 커널로 옮긴 버전입니다. 각 격자 셀의 계산을 병렬로 처리할 수 있으므로, 이류, 확산, 투영, 감쇠 같은 연산이 GPU 가속에 적합합니다.
 
-Current GPU-side optimizations include:
+현재 GPU 버전에 적용된 최적화는 다음과 같습니다.
 
-- skipping diffusion solves when `diff` or `visc` is zero
-- rendering density as one OpenGL texture instead of drawing `N * N` quads
-- skipping velocity `DeviceToHost` readback unless velocity overlay is enabled
+- `diff` 또는 `visc`가 0일 때 불필요한 확산 solve 생략
+- 밀도장을 `N * N`개의 OpenGL quad로 그리지 않고 하나의 텍스처로 업로드해 렌더링
+- 속도장 표시가 꺼져 있을 때 `u/v` 속도장의 `DeviceToHost` 복사 생략
 
-## Repository Layout
+## 저장소 구조
 
-| Path | Purpose |
-|------|---------|
-| `cpu/` | CPU-only GLUT viewer |
-| `gpu/` | CUDA GPU-only GLUT viewer |
-| `gpu/solver.cu` | CUDA solver kernels |
-| `gpu/solver.h` | CUDA solver declarations |
-| `gpu/THREE_D_PLAN.md` | Roadmap for extending the GPU version to 3D smoke |
+| 경로 | 설명 |
+|------|------|
+| `cpu/` | CPU 전용 GLUT 뷰어 |
+| `gpu/` | CUDA GPU 전용 GLUT 뷰어 |
+| `gpu/solver.cu` | CUDA solver 커널 구현 |
+| `gpu/solver.h` | CUDA solver 함수 선언 |
+| `gpu/THREE_D_PLAN.md` | GPU 버전을 3D 연기 시뮬레이션으로 확장하기 위한 계획 |
 
-## Requirements
+## 요구 사항
 
-Windows:
+Windows 기준:
 
 - NVIDIA CUDA Toolkit
-- Visual Studio Build Tools with the **Desktop development with C++** workload
+- Visual Studio Build Tools  
+  `Desktop development with C++` 워크로드 필요
 - freeglut
 
-If you use Anaconda, freeglut can be installed with:
+Anaconda를 사용한다면 freeglut은 다음 명령으로 설치할 수 있습니다.
 
 ```powershell
 conda install -c conda-forge freeglut
 ```
 
-The build scripts look for freeglut under:
+현재 빌드 스크립트는 freeglut을 아래 경로에서 찾습니다.
 
 ```text
 %USERPROFILE%\anaconda3\Library
 ```
 
-## Build And Run
+## 빌드 및 실행 방법
 
-Clone the repository:
+저장소를 clone합니다.
 
 ```powershell
 git clone https://github.com/Do1Yun/Fluid_CUDA.git
 cd Fluid_CUDA
 ```
 
-Build and run the CPU version:
+CPU 버전 빌드 및 실행:
 
 ```powershell
 cd cpu
@@ -101,7 +89,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\fluid2d_cpu.exe
 ```
 
-Build and run the GPU version:
+GPU 버전 빌드 및 실행:
 
 ```powershell
 cd ..\gpu
@@ -109,23 +97,22 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\fluid2d_gpu.exe
 ```
 
-## Controls
+## 조작법
 
-| Input | Action |
-|-------|--------|
-| Left mouse drag | Add velocity |
-| Right mouse drag | Add smoke density |
-| `c` | Clear simulation |
-| `p` | Pause/resume |
-| `v` | Toggle velocity-field overlay |
-| `q` or `ESC` | Quit |
+| 입력 | 동작 |
+|------|------|
+| 왼쪽 마우스 드래그 | 속도 추가 |
+| 오른쪽 마우스 드래그 | 연기 밀도 추가 |
+| `c` | 시뮬레이션 초기화 |
+| `p` | 일시정지/재개 |
+| `v` | 속도장 표시 켜기/끄기 |
+| `q` 또는 `ESC` | 종료 |
 
-## Notes
+## 참고
 
-The default grid size is controlled by `SIZE` in each viewer:
+기본 격자 크기는 각 뷰어의 `SIZE` 값으로 정합니다.
 
 - `cpu/main.cpp`
 - `gpu/main.cu`
 
-Larger values create more detailed smoke but increase simulation and rendering
-cost. The GPU version is the main target for future 3D expansion.
+`SIZE`가 커질수록 연기는 더 자세하게 표현되지만 계산량과 렌더링 비용도 증가합니다. 이후 확장은 GPU 버전을 중심으로 3D 연기 시뮬레이션까지 진행하는 것을 목표로 합니다.
