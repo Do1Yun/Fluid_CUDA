@@ -282,6 +282,19 @@ static void draw_velocity_field(const float *u, const float *v) {
     if (stride < 4) stride = 4;
     float spacing = stride * h;
 
+    glPointSize(3.0f);
+    glColor3f(0.0f, 0.75f, 0.10f);
+    glBegin(GL_POINTS);
+    for (int i = stride / 2 + 1; i <= N; i += stride) {
+        float x = (i - 0.5f) * h;
+        for (int j = stride / 2 + 1; j <= N; j += stride) {
+            float y = (j - 0.5f) * h;
+            glVertex2f(x, y);
+        }
+    }
+    glEnd();
+    glPointSize(1.0f);
+
     glLineWidth(1.5f);
     glBegin(GL_LINES);
     for (int i = stride / 2 + 1; i <= N; i += stride) {
