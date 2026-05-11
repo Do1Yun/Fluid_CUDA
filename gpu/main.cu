@@ -364,6 +364,8 @@ static void display(void) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     draw_text(0.01f, 0.97f, buf);
+    draw_text(0.01f, 0.02f,
+              "LMB: velocity | RMB: smoke | c: clear | p: pause | v: vectors | q/ESC: quit");
 
     glutSwapBuffers();
 }
@@ -442,10 +444,35 @@ static void keyboard(unsigned char key, int x, int y) {
     }
 }
 
+static void prompt_grid_size(void) {
+    char line[64];
+    printf("Grid size N [default %d, suggested 256/512/1024]: ", N);
+    fflush(stdout);
+
+    if (!fgets(line, sizeof(line), stdin)) {
+        return;
+    }
+
+    if (line[0] == '\n' || line[0] == '\r' || line[0] == '\0') {
+        return;
+    }
+
+    int value = atoi(line);
+    if (value < 16) {
+        printf("N is too small; using 16.\n");
+        value = 16;
+    } else if (value > 2048) {
+        printf("N is too large for this viewer; using 2048.\n");
+        value = 2048;
+    }
+    N = value;
+}
+
 int main(int argc, char **argv) {
     glutInit(&argc, argv);
 
     printf("=== Stable Fluids 2D (GPU/CUDA) ===\n");
+    prompt_grid_size();
     printf("Grid: N=%d (interior), total %dx%d cells\n",
            N, N + 2, N + 2);
     printf("Controls:\n");

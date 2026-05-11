@@ -89,6 +89,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\fluid2d_cpu.exe
 ```
 
+실행하면 콘솔에서 격자 크기 `N`을 입력받습니다. Enter만 누르면 기본값 `1024`로 실행됩니다.
+
 GPU 버전 빌드 및 실행:
 
 ```powershell
@@ -96,6 +98,8 @@ cd ..\gpu
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 .\fluid2d_gpu.exe
 ```
+
+GPU 버전도 실행 시 같은 방식으로 격자 크기 `N`을 입력받습니다. 여러 해상도를 비교하고 싶다면 프로그램을 다시 실행한 뒤 `256`, `512`, `1024`처럼 원하는 값을 입력하면 됩니다.
 
 ## 조작법
 
@@ -110,7 +114,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ## 참고
 
-기본 격자 크기는 각 뷰어의 `SIZE` 값으로 정합니다.
+기본 격자 크기는 각 뷰어의 `SIZE` 값으로 정해져 있지만, 실행할 때 콘솔에서 다른 값을 입력할 수 있습니다.
 
 - `cpu/main.cpp`
 - `gpu/main.cu`
