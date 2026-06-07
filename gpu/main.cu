@@ -45,22 +45,28 @@ static float dissipation = 0.995f;
 static float force  = 5.0f;
 static float source = 100.0f;
 static int brush_cells_divisor = 64;
-static float velocity_vis_scale = 0.25f;
-static int velocity_arrow_divisor = 32;
+static float smoke_color_speed_scale = 0.55f;
+static float velocity_vis_scale = 0.70f;
+static int velocity_arrow_divisor = 24;
 
 static float *h_u, *h_v, *h_u_prev, *h_v_prev;
 static float *h_dens, *h_dens_prev;
 static unsigned char *h_density_pixels;
+static unsigned char *h_solid;
 
 static float *d_u, *d_v, *d_u_prev, *d_v_prev;
 static float *d_dens, *d_dens_prev;
+static unsigned char *d_solid;
 static GLuint density_tex = 0;
 
 static int win_x = 512, win_y = 512;
 static int mouse_down[3];
 static int omx, omy, mx, my;
 static int paused = 0;
-static int draw_velocity = 0;
+static int draw_velocity = 1;
+static int auto_smoke = 1;
+static int obstacle_mode = 0;
+static int obstacle_dirty = 0;
 
 static int   frame_count   = 0;
 static double fps_accum    = 0.0;
@@ -103,9 +109,17 @@ static void clear_data(void) {
     CUDA_CHECK(cudaMemcpy(d_dens_prev, h_dens_prev, bytes, cudaMemcpyHostToDevice));
 }
 
+static void clear_obstacles(void) {
+    int size = (N + 2) * (N + 2);
+    memset(h_solid, 0, (size_t)size);
+    CUDA_CHECK(cudaMemset(d_solid, 0, (size_t)size));
+    obstacle_dirty = 0;
+}
+
 static int allocate_data(void) {
     int size = (N + 2) * (N + 2);
     int bytes = size * sizeof(float);
+    int mask_bytes = size * (int)sizeof(unsigned char);
     
     h_u         = (float *)malloc(bytes);
     h_v         = (float *)malloc(bytes);
@@ -114,8 +128,9 @@ static int allocate_data(void) {
     h_dens      = (float *)malloc(bytes);
     h_dens_prev = (float *)malloc(bytes);
     h_density_pixels = (unsigned char *)malloc((size_t)N * N * 4);
+    h_solid = (unsigned char *)malloc(mask_bytes);
     if (!h_u || !h_v || !h_u_prev || !h_v_prev || !h_dens || !h_dens_prev ||
-        !h_density_pixels) {
+        !h_density_pixels || !h_solid) {
         fprintf(stderr, "ERROR: out of memory\n");
         return 0;
     }
@@ -126,6 +141,7 @@ static int allocate_data(void) {
     CUDA_CHECK(cudaMalloc(&d_v_prev, bytes));
     CUDA_CHECK(cudaMalloc(&d_dens, bytes));
     CUDA_CHECK(cudaMalloc(&d_dens_prev, bytes));
+    CUDA_CHECK(cudaMalloc(&d_solid, mask_bytes));
 
     init_solver(N);
     return 1;
@@ -135,6 +151,7 @@ static void free_data(void) {
     free(h_u); free(h_v); free(h_u_prev); free(h_v_prev);
     free(h_dens); free(h_dens_prev);
     free(h_density_pixels);
+    free(h_solid);
     if (density_tex) {
         glDeleteTextures(1, &density_tex);
         density_tex = 0;
@@ -146,8 +163,35 @@ static void free_data(void) {
     CUDA_CHECK(cudaFree(d_v_prev));
     CUDA_CHECK(cudaFree(d_dens));
     CUDA_CHECK(cudaFree(d_dens_prev));
+    CUDA_CHECK(cudaFree(d_solid));
     
     free_solver();
+}
+
+static void paint_obstacle_at(int erase) {
+    int view_w = win_x > 0 ? win_x : 1;
+    int view_h = win_y > 0 ? win_y : 1;
+    int i = (int)((mx / (float)view_w) * N + 1);
+    int j = (int)(((view_h - my) / (float)view_h) * N + 1);
+    if (i < 1 || i > N || j < 1 || j > N) return;
+
+    int radius = N / brush_cells_divisor;
+    if (radius < 2) radius = 2;
+    float inv_radius2 = 1.0f / (float)(radius * radius);
+    for (int jj = j - radius; jj <= j + radius; jj++) {
+        if (jj < 1 || jj > N) continue;
+        for (int ii = i - radius; ii <= i + radius; ii++) {
+            if (ii < 1 || ii > N) continue;
+            int dx = ii - i;
+            int dy = jj - j;
+            float dist2 = (float)(dx * dx + dy * dy);
+            if (dist2 > (float)(radius * radius)) continue;
+            if (1.0f - dist2 * inv_radius2 <= 0.0f) continue;
+            h_solid[IX(ii, jj)] = erase ? 0 : 1;
+            h_u[IX(ii, jj)] = h_v[IX(ii, jj)] = h_dens[IX(ii, jj)] = 0.0f;
+        }
+    }
+    obstacle_dirty = 1;
 }
 
 static void get_from_UI(float *d, float *u_, float *v_) {
@@ -156,6 +200,12 @@ static void get_from_UI(float *d, float *u_, float *v_) {
         u_[i] = v_[i] = d[i] = 0.0f;
 
     if (!mouse_down[0] && !mouse_down[2]) return;
+
+    if (obstacle_mode) {
+        if (mouse_down[0]) paint_obstacle_at(0);
+        if (mouse_down[2]) paint_obstacle_at(1);
+        return;
+    }
 
     int view_w = win_x;
     if (view_w <= 0) view_w = win_x;
@@ -238,19 +288,69 @@ static void ensure_density_texture(void) {
                  GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 }
 
-static void update_density_texture(const float *dens) {
+static void hsv_to_rgb(float h, float s, float v, float *r, float *g, float *b) {
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h * 6.0f, 2.0f) - 1.0f));
+    float m = v - c;
+    float rp = 0.0f, gp = 0.0f, bp = 0.0f;
+    int band = (int)(h * 6.0f);
+
+    switch (band) {
+        case 0: rp = c; gp = x; break;
+        case 1: rp = x; gp = c; break;
+        case 2: gp = c; bp = x; break;
+        case 3: gp = x; bp = c; break;
+        case 4: rp = x; bp = c; break;
+        default: rp = c; bp = x; break;
+    }
+
+    *r = rp + m;
+    *g = gp + m;
+    *b = bp + m;
+}
+
+static void color_from_density_velocity(float dens, float u, float v,
+                                        unsigned char *r,
+                                        unsigned char *g,
+                                        unsigned char *b) {
+    float visual_dens = 1.0f - expf(-dens * 0.18f);
+    if (visual_dens < 0.0f) visual_dens = 0.0f;
+    if (visual_dens > 1.0f) visual_dens = 1.0f;
+
+    float speed = sqrtf(u * u + v * v);
+    float t = 1.0f - expf(-speed * smoke_color_speed_scale);
+    if (t > 1.0f) t = 1.0f;
+
+    float shade = visual_dens * (0.72f + 0.28f * t);
+    float tint_r, tint_g, tint_b;
+    hsv_to_rgb(0.58f - 0.48f * t, 0.78f, 1.0f, &tint_r, &tint_g, &tint_b);
+
+    float tint_strength = 0.10f + 0.42f * t;
+    float rf = shade * ((1.0f - tint_strength) + tint_strength * tint_r);
+    float gf = shade * ((1.0f - tint_strength) + tint_strength * tint_g);
+    float bf = shade * ((1.0f - tint_strength) + tint_strength * tint_b);
+    *r = (unsigned char)(rf * 255.0f);
+    *g = (unsigned char)(gf * 255.0f);
+    *b = (unsigned char)(bf * 255.0f);
+}
+
+static void update_density_texture(const float *dens, const float *u, const float *v,
+                                   const unsigned char *solid) {
     ensure_density_texture();
 
     for (int j = 1; j <= N; j++) {
         for (int i = 1; i <= N; i++) {
-            float d = dens[IX(i, j)];
-            if (d < 0.0f) d = 0.0f;
-            if (d > 1.0f) d = 1.0f;
-            unsigned char c = (unsigned char)(d * 255.0f);
             int out = ((j - 1) * N + (i - 1)) * 4;
-            h_density_pixels[out + 0] = c;
-            h_density_pixels[out + 1] = c;
-            h_density_pixels[out + 2] = c;
+            if (solid && solid[IX(i, j)]) {
+                h_density_pixels[out + 0] = 26;
+                h_density_pixels[out + 1] = 30;
+                h_density_pixels[out + 2] = 34;
+            } else {
+                color_from_density_velocity(dens[IX(i, j)], u[IX(i, j)], v[IX(i, j)],
+                                            &h_density_pixels[out + 0],
+                                            &h_density_pixels[out + 1],
+                                            &h_density_pixels[out + 2]);
+            }
             h_density_pixels[out + 3] = 255;
         }
     }
@@ -261,8 +361,9 @@ static void update_density_texture(const float *dens) {
                     GL_RGBA, GL_UNSIGNED_BYTE, h_density_pixels);
 }
 
-static void draw_density_field(const float *dens) {
-    update_density_texture(dens);
+static void draw_density_field(const float *dens, const float *u, const float *v,
+                               const unsigned char *solid) {
+    update_density_texture(dens, u, v, solid);
 
     glColor3f(1.0f, 1.0f, 1.0f);
     glEnable(GL_TEXTURE_2D);
@@ -282,7 +383,7 @@ static void draw_velocity_field(const float *u, const float *v) {
     if (stride < 4) stride = 4;
     float spacing = stride * h;
 
-    glLineWidth(1.5f);
+    glLineWidth(2.0f);
     glBegin(GL_LINES);
     for (int i = stride / 2 + 1; i <= N; i += stride) {
         float x = (i - 0.5f) * h;
@@ -307,11 +408,10 @@ static void draw_velocity_field(const float *u, const float *v) {
             }
 
             float speed = sqrtf(vx * vx + vy * vy);
-            if (speed < 0.0005f) continue;
+            if (speed < 0.00015f) continue;
 
-            float magnitude = speed * velocity_vis_scale;
-            if (magnitude > 0.75f) magnitude = 0.75f;
-            float len = spacing * (0.15f + magnitude);
+            float magnitude = 1.0f - expf(-speed * velocity_vis_scale);
+            float len = spacing * (0.22f + 1.05f * magnitude);
             float dir_x = vx / speed;
             float dir_y = vy / speed;
             float end_x = x + dir_x * len;
@@ -320,10 +420,12 @@ static void draw_velocity_field(const float *u, const float *v) {
             float head_w = len * 0.18f;
             float px = -dir_y;
             float py = dir_x;
-            float intensity = speed * 0.20f;
+            float intensity = 1.0f - expf(-speed * 0.70f);
             if (intensity > 1.0f) intensity = 1.0f;
 
-            glColor3f(0.15f + 0.85f * intensity, 1.0f, 0.15f);
+            glColor3f(0.10f + 0.90f * intensity,
+                      0.85f + 0.15f * intensity,
+                      1.00f - 0.65f * intensity);
             glVertex2f(x, y);
             glVertex2f(end_x, end_y);
 
@@ -357,7 +459,7 @@ static void draw_panel(int x, int w, const char *name,
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
-    draw_density_field(dens);
+    draw_density_field(dens, u, v, h_solid);
     if (draw_velocity) draw_velocity_field(u, v);
 
     char buf[160];
@@ -372,7 +474,9 @@ static void display(void) {
     draw_panel(0, win_x, "GPU", h_dens, h_u, h_v, current_step_ms);
 
     char buf[128];
-    snprintf(buf, sizeof(buf), "N=%d  FPS=%.1f  v: velocity", N, current_fps);
+    snprintf(buf, sizeof(buf), "N=%d  FPS=%.1f  v: vectors  a: auto %s  o: obstacle %s",
+             N, current_fps, auto_smoke ? "on" : "off",
+             obstacle_mode ? "paint" : "off");
     glViewport(0, 0, win_x, win_y);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
@@ -381,7 +485,9 @@ static void display(void) {
     glLoadIdentity();
     draw_text(0.01f, 0.97f, buf);
     draw_text(0.01f, 0.02f,
-              "LMB: velocity | RMB: smoke | c: clear | p: pause | v: vectors | q/ESC: quit");
+              obstacle_mode
+              ? "Obstacle: LMB draw | RMB erase | o: fluid mode | x: clear walls | ESC: quit"
+              : "LMB: velocity | RMB: smoke | o: walls | a: auto | c: clear | p: pause | v: vectors | ESC: quit");
 
     glutSwapBuffers();
 }
@@ -389,19 +495,27 @@ static void display(void) {
 static void idle(void) {
     if (!paused) {
         get_from_UI(h_dens_prev, h_u_prev, h_v_prev);
-        add_auto_smoke(h_dens_prev, h_v_prev);
+        if (auto_smoke && !obstacle_mode) add_auto_smoke(h_dens_prev, h_v_prev);
 
         int bytes = (N + 2) * (N + 2) * sizeof(float);
+        int mask_bytes = (N + 2) * (N + 2) * (int)sizeof(unsigned char);
+        if (obstacle_dirty) {
+            CUDA_CHECK(cudaMemcpy(d_solid, h_solid, mask_bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_dens, h_dens, bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_u, h_u, bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_v, h_v, bytes, cudaMemcpyHostToDevice));
+            obstacle_dirty = 0;
+        }
 
         CUDA_CHECK(cudaMemcpy(d_dens_prev, h_dens_prev, bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_u_prev, h_u_prev, bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_v_prev, h_v_prev, bytes, cudaMemcpyHostToDevice));
         
         double step_t0 = now_seconds();
-        vel_step(N, d_u, d_v, d_u_prev, d_v_prev, visc, dt);
-        dens_step(N, d_dens, d_dens_prev, d_u, d_v, diff, dt);
+        vel_step(N, d_u, d_v, d_u_prev, d_v_prev, visc, dt, d_solid);
+        dens_step(N, d_dens, d_dens_prev, d_u, d_v, diff, dt, d_solid);
         
-        fade_fields(N, d_dens, d_u, d_v, dissipation, 0.99f);
+        fade_fields(N, d_dens, d_u, d_v, dissipation, 0.99f, d_solid);
         
         CUDA_CHECK(cudaDeviceSynchronize());
         double step_t1 = now_seconds();
@@ -411,10 +525,8 @@ static void idle(void) {
         frame_count++;
 
         CUDA_CHECK(cudaMemcpy(h_dens, d_dens, bytes, cudaMemcpyDeviceToHost));
-        if (draw_velocity) {
-            CUDA_CHECK(cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_v, d_v, bytes, cudaMemcpyDeviceToHost));
-        }
+        CUDA_CHECK(cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_v, d_v, bytes, cudaMemcpyDeviceToHost));
 
         double now = now_seconds();
         if (now - last_fps_time >= 0.5) {
@@ -457,6 +569,9 @@ static void keyboard(unsigned char key, int x, int y) {
         case 'q': case 'Q': case 27: free_data(); exit(0);
         case 'p': case 'P': paused = !paused; break;
         case 'v': case 'V': draw_velocity = !draw_velocity; break;
+        case 'a': case 'A': auto_smoke = !auto_smoke; break;
+        case 'o': case 'O': obstacle_mode = !obstacle_mode; break;
+        case 'x': case 'X': clear_obstacles(); break;
     }
 }
 
@@ -497,9 +612,13 @@ int main(int argc, char **argv) {
     printf("  c                : clear\n");
     printf("  p                : pause\n");
     printf("  v                : toggle velocity field\n");
+    printf("  a                : toggle automatic smoke source\n");
+    printf("  o                : obstacle paint mode (LMB draw, RMB erase)\n");
+    printf("  x                : clear obstacles\n");
     printf("  q / ESC          : quit\n\n");
 
     if (!allocate_data()) return 1;
+    clear_obstacles();
     clear_data();
 
     glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);

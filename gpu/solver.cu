@@ -39,6 +39,57 @@ __global__ void add_source_kernel(int N, float *x, float *s, float dt) {
     }
 }
 
+__global__ void apply_solid_scalar_kernel(int N, float *x, unsigned char *solid) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < N + 2 && j < N + 2) {
+        int idx = IX(i, j);
+        if (solid && solid[idx]) {
+            float sum = 0.0f;
+            int count = 0;
+            if (i > 1 && !solid[IX(i - 1, j)]) { sum += x[IX(i - 1, j)]; count++; }
+            if (i < N && !solid[IX(i + 1, j)]) { sum += x[IX(i + 1, j)]; count++; }
+            if (j > 1 && !solid[IX(i, j - 1)]) { sum += x[IX(i, j - 1)]; count++; }
+            if (j < N && !solid[IX(i, j + 1)]) { sum += x[IX(i, j + 1)]; count++; }
+            x[idx] = (count > 0) ? sum / (float)count : 0.0f;
+        }
+    }
+}
+
+__global__ void apply_solid_velocity_kernel(int N, float *u, float *v, unsigned char *solid) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < N + 2 && j < N + 2) {
+        int idx = IX(i, j);
+        if (!solid) return;
+        if (solid[idx]) {
+            u[idx] = 0.0f;
+            v[idx] = 0.0f;
+            return;
+        }
+        if (i > 1 && solid[IX(i - 1, j)] && u[idx] < 0.0f) u[idx] = 0.0f;
+        if (i < N && solid[IX(i + 1, j)] && u[idx] > 0.0f) u[idx] = 0.0f;
+        if (j > 1 && solid[IX(i, j - 1)] && v[idx] < 0.0f) v[idx] = 0.0f;
+        if (j < N && solid[IX(i, j + 1)] && v[idx] > 0.0f) v[idx] = 0.0f;
+    }
+}
+
+static void apply_solid_scalar(int N, float *x, unsigned char *solid) {
+    if (!solid) return;
+    dim3 threads(16, 16);
+    dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
+    apply_solid_scalar_kernel<<<blocks, threads>>>(N, x, solid);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+static void apply_solid_velocity(int N, float *u, float *v, unsigned char *solid) {
+    if (!solid) return;
+    dim3 threads(16, 16);
+    dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
+    apply_solid_velocity_kernel<<<blocks, threads>>>(N, u, v, solid);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
 __global__ void set_bnd_kernel(int N, int b, float *x) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x + 1;
     if (idx <= N) {
@@ -107,10 +158,40 @@ static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
     lin_solve(N, b, x, x0, a, 1 + 4 * a);
 }
 
-__global__ void advect_kernel(int N, int b, float *d, float *d0, float *u, float *v, float dt0) {
+__device__ float sample_fluid_bilinear(int N, float *field, unsigned char *solid,
+                                       int i, int j,
+                                       int i0, int i1, int j0, int j1,
+                                       float s0, float s1, float t0, float t1) {
+    float value = 0.0f;
+    float weight = 0.0f;
+    float current = field[IX(i, j)];
+
+    int idx = IX(i0, j0);
+    float w = s0 * t0;
+    if (!solid || !solid[idx]) { value += w * field[idx]; weight += w; }
+    idx = IX(i0, j1);
+    w = s0 * t1;
+    if (!solid || !solid[idx]) { value += w * field[idx]; weight += w; }
+    idx = IX(i1, j0);
+    w = s1 * t0;
+    if (!solid || !solid[idx]) { value += w * field[idx]; weight += w; }
+    idx = IX(i1, j1);
+    w = s1 * t1;
+    if (!solid || !solid[idx]) { value += w * field[idx]; weight += w; }
+
+    return (weight > 0.000001f) ? value / weight : current;
+}
+
+__global__ void advect_kernel(int N, int b, float *d, float *d0,
+                              float *u, float *v, float dt0,
+                              unsigned char *solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
+        if (solid && solid[IX(i, j)]) {
+            d[IX(i, j)] = d0[IX(i, j)];
+            return;
+        }
         float x = i - dt0 * u[IX(i, j)];
         float y = j - dt0 * v[IX(i, j)];
         if (x < 0.5f) x = 0.5f;
@@ -125,81 +206,118 @@ __global__ void advect_kernel(int N, int b, float *d, float *d0, float *u, float
         float s0 = 1.0f - s1;
         float t1 = y - j0;
         float t0 = 1.0f - t1;
-        d[IX(i, j)] = s0 * (t0 * d0[IX(i0, j0)] + t1 * d0[IX(i0, j1)]) +
-                      s1 * (t0 * d0[IX(i1, j0)] + t1 * d0[IX(i1, j1)]);
+        d[IX(i, j)] = sample_fluid_bilinear(N, d0, solid, i, j,
+                                            i0, i1, j0, j1,
+                                            s0, s1, t0, t1);
     }
 }
 
-static void advect(int N, int b, float *d, float *d0, float *u, float *v, float dt) {
+static void advect(int N, int b, float *d, float *d0, float *u, float *v,
+                   float dt, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
     float dt0 = dt * N;
-    advect_kernel<<<blocks, threads>>>(N, b, d, d0, u, v, dt0);
+    advect_kernel<<<blocks, threads>>>(N, b, d, d0, u, v, dt0, solid);
     CUDA_CHECK(cudaPeekAtLastError());
     set_bnd(N, b, d);
 }
 
-__global__ void project_div_kernel(int N, float *u, float *v, float *p, float *div) {
+__global__ void project_div_kernel(int N, float *u, float *v, float *p, float *div,
+                                   unsigned char *solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
-        div[IX(i, j)] = -0.5f * (u[IX(i + 1, j)] - u[IX(i - 1, j)] +
-                                 v[IX(i, j + 1)] - v[IX(i, j - 1)]) / N;
+        int idx = IX(i, j);
+        if (solid && solid[idx]) {
+            div[idx] = 0.0f;
+            p[idx] = 0.0f;
+            return;
+        }
+        float u_r = (!solid || !solid[IX(i + 1, j)]) ? u[IX(i + 1, j)] : 0.0f;
+        float u_l = (!solid || !solid[IX(i - 1, j)]) ? u[IX(i - 1, j)] : 0.0f;
+        float v_t = (!solid || !solid[IX(i, j + 1)]) ? v[IX(i, j + 1)] : 0.0f;
+        float v_b = (!solid || !solid[IX(i, j - 1)]) ? v[IX(i, j - 1)] : 0.0f;
+        div[IX(i, j)] = -0.5f * (u_r - u_l + v_t - v_b) / N;
         p[IX(i, j)] = 0;
     }
 }
 
-__global__ void project_update_kernel(int N, float *u, float *v, float *p) {
+__global__ void project_update_kernel(int N, float *u, float *v, float *p,
+                                      unsigned char *solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
-        u[IX(i, j)] -= 0.5f * N * (p[IX(i + 1, j)] - p[IX(i - 1, j)]);
-        v[IX(i, j)] -= 0.5f * N * (p[IX(i, j + 1)] - p[IX(i, j - 1)]);
+        int idx = IX(i, j);
+        if (solid && solid[idx]) {
+            u[idx] = 0.0f;
+            v[idx] = 0.0f;
+            return;
+        }
+        float p_c = p[idx];
+        float p_r = (!solid || !solid[IX(i + 1, j)]) ? p[IX(i + 1, j)] : p_c;
+        float p_l = (!solid || !solid[IX(i - 1, j)]) ? p[IX(i - 1, j)] : p_c;
+        float p_t = (!solid || !solid[IX(i, j + 1)]) ? p[IX(i, j + 1)] : p_c;
+        float p_b = (!solid || !solid[IX(i, j - 1)]) ? p[IX(i, j - 1)] : p_c;
+        u[idx] -= 0.5f * N * (p_r - p_l);
+        v[idx] -= 0.5f * N * (p_t - p_b);
     }
 }
 
-static void project(int N, float *u, float *v, float *p, float *div) {
+static void project(int N, float *u, float *v, float *p, float *div, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
-    project_div_kernel<<<blocks, threads>>>(N, u, v, p, div);
+    project_div_kernel<<<blocks, threads>>>(N, u, v, p, div, solid);
     CUDA_CHECK(cudaPeekAtLastError());
     set_bnd(N, 0, div);
     set_bnd(N, 0, p);
+    apply_solid_scalar(N, div, solid);
+    apply_solid_scalar(N, p, solid);
     lin_solve(N, 0, p, div, 1, 4);
-    project_update_kernel<<<blocks, threads>>>(N, u, v, p);
+    apply_solid_scalar(N, p, solid);
+    project_update_kernel<<<blocks, threads>>>(N, u, v, p, solid);
     CUDA_CHECK(cudaPeekAtLastError());
     set_bnd(N, 1, u);
     set_bnd(N, 2, v);
 }
 
-void dens_step(int N, float *x, float *x0, float *u, float *v, float diff, float dt) {
+void dens_step(int N, float *x, float *x0, float *u, float *v,
+               float diff, float dt, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
     add_source_kernel<<<blocks, threads>>>(N, x, x0, dt);
     CUDA_CHECK(cudaPeekAtLastError());
+    apply_solid_scalar(N, x, solid);
     SWAP(x0, x);
     diffuse(N, 0, x, x0, diff, dt);
+    apply_solid_scalar(N, x, solid);
     SWAP(x0, x);
-    advect(N, 0, x, x0, u, v, dt);
+    advect(N, 0, x, x0, u, v, dt, solid);
+    apply_solid_scalar(N, x, solid);
 }
 
-void vel_step(int N, float *u, float *v, float *u0, float *v0, float visc, float dt) {
+void vel_step(int N, float *u, float *v, float *u0, float *v0,
+              float visc, float dt, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
     add_source_kernel<<<blocks, threads>>>(N, u, u0, dt);
     CUDA_CHECK(cudaPeekAtLastError());
     add_source_kernel<<<blocks, threads>>>(N, v, v0, dt);
     CUDA_CHECK(cudaPeekAtLastError());
+    apply_solid_velocity(N, u, v, solid);
     SWAP(u0, u);
     diffuse(N, 1, u, u0, visc, dt);
     SWAP(v0, v);
     diffuse(N, 2, v, v0, visc, dt);
-    project(N, u, v, u0, v0);
+    apply_solid_velocity(N, u, v, solid);
+    project(N, u, v, u0, v0, solid);
+    apply_solid_velocity(N, u, v, solid);
     SWAP(u0, u);
     SWAP(v0, v);
-    advect(N, 1, u, u0, u0, v0, dt);
-    advect(N, 2, v, v0, u0, v0, dt);
-    project(N, u, v, u0, v0);
+    advect(N, 1, u, u0, u0, v0, dt, solid);
+    advect(N, 2, v, v0, u0, v0, dt, solid);
+    apply_solid_velocity(N, u, v, solid);
+    project(N, u, v, u0, v0, solid);
+    apply_solid_velocity(N, u, v, solid);
 }
 
 __global__ void fade_fields_kernel(int N, float *d_dens, float *d_u, float *d_v, float dissipation, float vel_damping) {
@@ -213,9 +331,12 @@ __global__ void fade_fields_kernel(int N, float *d_dens, float *d_u, float *d_v,
     }
 }
 
-void fade_fields(int N, float *d_dens, float *d_u, float *d_v, float dissipation, float vel_damping) {
+void fade_fields(int N, float *d_dens, float *d_u, float *d_v,
+                 float dissipation, float vel_damping, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
     fade_fields_kernel<<<blocks, threads>>>(N, d_dens, d_u, d_v, dissipation, vel_damping);
     CUDA_CHECK(cudaPeekAtLastError());
+    apply_solid_scalar(N, d_dens, solid);
+    apply_solid_velocity(N, d_u, d_v, solid);
 }
