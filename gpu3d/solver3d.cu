@@ -30,13 +30,33 @@ void free_solver3d() {
     }
 }
 
-__global__ void add_source_kernel3d(int N, float *x, float *s, float dt) {
+__global__ void add_source_kernel3d(int N, float *__restrict__ x,
+                                    const float *__restrict__ s, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.z * blockDim.z + threadIdx.z;
     if (i < N + 2 && j < N + 2 && k < N + 2) {
         int idx = IX3(i, j, k);
         x[idx] += dt * s[idx];
+    }
+}
+
+__global__ void add_velocity_source_kernel3d(int N,
+                                             float *__restrict__ u,
+                                             float *__restrict__ v,
+                                             float *__restrict__ w,
+                                             const float *__restrict__ u0,
+                                             const float *__restrict__ v0,
+                                             const float *__restrict__ w0,
+                                             float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+    if (i < N + 2 && j < N + 2 && k < N + 2) {
+        int idx = IX3(i, j, k);
+        u[idx] += dt * u0[idx];
+        v[idx] += dt * v0[idx];
+        w[idx] += dt * w0[idx];
     }
 }
 
@@ -258,9 +278,7 @@ void vel_step3d(int N, float *u, float *v, float *w,
                 float visc, float dt) {
     dim3 threads(8, 8, 4);
     dim3 blocks((N + 2 + 7) / 8, (N + 2 + 7) / 8, (N + 2 + 3) / 4);
-    add_source_kernel3d<<<blocks, threads>>>(N, u, u0, dt);
-    add_source_kernel3d<<<blocks, threads>>>(N, v, v0, dt);
-    add_source_kernel3d<<<blocks, threads>>>(N, w, w0, dt);
+    add_velocity_source_kernel3d<<<blocks, threads>>>(N, u, v, w, u0, v0, w0, dt);
     CUDA_CHECK(cudaPeekAtLastError());
     SWAP(u0, u);
     diffuse3d(N, 1, u, u0, visc, dt);

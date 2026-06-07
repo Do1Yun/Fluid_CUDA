@@ -30,7 +30,8 @@ void free_solver() {
     }
 }
 
-__global__ void add_source_kernel(int N, float *x, float *s, float dt) {
+__global__ void add_source_kernel(int N, float *__restrict__ x,
+                                  const float *__restrict__ s, float dt) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < N + 2 && j < N + 2) {
@@ -39,7 +40,23 @@ __global__ void add_source_kernel(int N, float *x, float *s, float dt) {
     }
 }
 
-__global__ void apply_solid_scalar_kernel(int N, float *x, unsigned char *solid) {
+__global__ void add_velocity_source_kernel(int N,
+                                           float *__restrict__ u,
+                                           float *__restrict__ v,
+                                           const float *__restrict__ u0,
+                                           const float *__restrict__ v0,
+                                           float dt) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < N + 2 && j < N + 2) {
+        int idx = IX(i, j);
+        u[idx] += dt * u0[idx];
+        v[idx] += dt * v0[idx];
+    }
+}
+
+__global__ void apply_solid_scalar_kernel(int N, float *__restrict__ x,
+                                          const unsigned char *__restrict__ solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < N + 2 && j < N + 2) {
@@ -56,7 +73,10 @@ __global__ void apply_solid_scalar_kernel(int N, float *x, unsigned char *solid)
     }
 }
 
-__global__ void apply_solid_velocity_kernel(int N, float *u, float *v, unsigned char *solid) {
+__global__ void apply_solid_velocity_kernel(int N,
+                                            float *__restrict__ u,
+                                            float *__restrict__ v,
+                                            const unsigned char *__restrict__ solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i < N + 2 && j < N + 2) {
@@ -90,32 +110,37 @@ static void apply_solid_velocity(int N, float *u, float *v, unsigned char *solid
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
-__global__ void set_bnd_kernel(int N, int b, float *x) {
+__global__ void set_bnd_kernel(int N, int b, float *__restrict__ x) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x + 1;
     if (idx <= N) {
         x[IX(0, idx)]     = (b == 1) ? -x[IX(1, idx)] : x[IX(1, idx)];
         x[IX(N + 1, idx)] = (b == 1) ? -x[IX(N, idx)] : x[IX(N, idx)];
         x[IX(idx, 0)]     = (b == 2) ? -x[IX(idx, 1)] : x[IX(idx, 1)];
         x[IX(idx, N + 1)] = (b == 2) ? -x[IX(idx, N)] : x[IX(idx, N)];
-    }
-}
 
-__global__ void set_bnd_corners_kernel(int N, float *x) {
-    x[IX(0, 0)]         = 0.5f * (x[IX(1, 0)]     + x[IX(0, 1)]);
-    x[IX(0, N + 1)]     = 0.5f * (x[IX(1, N + 1)] + x[IX(0, N)]);
-    x[IX(N + 1, 0)]     = 0.5f * (x[IX(N, 0)]     + x[IX(N + 1, 1)]);
-    x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
+        if (idx == 1) {
+            float sx = (b == 1) ? -1.0f : 1.0f;
+            float sy = (b == 2) ? -1.0f : 1.0f;
+            float corner_scale = 0.5f * (sx + sy);
+            x[IX(0, 0)]             = corner_scale * x[IX(1, 1)];
+            x[IX(0, N + 1)]         = corner_scale * x[IX(1, N)];
+            x[IX(N + 1, 0)]         = corner_scale * x[IX(N, 1)];
+            x[IX(N + 1, N + 1)]     = corner_scale * x[IX(N, N)];
+        }
+    }
 }
 
 static void set_bnd(int N, int b, float *d_x) {
     int blocks = (N + 255) / 256;
     set_bnd_kernel<<<blocks, 256>>>(N, b, d_x);
     CUDA_CHECK(cudaPeekAtLastError());
-    set_bnd_corners_kernel<<<1, 1>>>(N, d_x);
-    CUDA_CHECK(cudaPeekAtLastError());
 }
 
-__global__ void lin_solve_jacobi_kernel(int N, float *x_new, float *x, float *x0, float a, float c) {
+__global__ void lin_solve_jacobi_kernel(int N,
+                                        float *__restrict__ x_new,
+                                        const float *__restrict__ x,
+                                        const float *__restrict__ x0,
+                                        float a, float c) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
@@ -158,7 +183,9 @@ static void diffuse(int N, int b, float *x, float *x0, float diff, float dt) {
     lin_solve(N, b, x, x0, a, 1 + 4 * a);
 }
 
-__device__ float sample_fluid_bilinear(int N, float *field, unsigned char *solid,
+__device__ float sample_fluid_bilinear(int N,
+                                       const float *__restrict__ field,
+                                       const unsigned char *__restrict__ solid,
                                        int i, int j,
                                        int i0, int i1, int j0, int j1,
                                        float s0, float s1, float t0, float t1) {
@@ -182,9 +209,13 @@ __device__ float sample_fluid_bilinear(int N, float *field, unsigned char *solid
     return (weight > 0.000001f) ? value / weight : current;
 }
 
-__global__ void advect_kernel(int N, int b, float *d, float *d0,
-                              float *u, float *v, float dt0,
-                              unsigned char *solid) {
+__global__ void advect_kernel(int N, int b,
+                              float *__restrict__ d,
+                              const float *__restrict__ d0,
+                              const float *__restrict__ u,
+                              const float *__restrict__ v,
+                              float dt0,
+                              const unsigned char *__restrict__ solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
@@ -222,8 +253,12 @@ static void advect(int N, int b, float *d, float *d0, float *u, float *v,
     set_bnd(N, b, d);
 }
 
-__global__ void project_div_kernel(int N, float *u, float *v, float *p, float *div,
-                                   unsigned char *solid) {
+__global__ void project_div_kernel(int N,
+                                   const float *__restrict__ u,
+                                   const float *__restrict__ v,
+                                   float *__restrict__ p,
+                                   float *__restrict__ div,
+                                   const unsigned char *__restrict__ solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
@@ -242,8 +277,11 @@ __global__ void project_div_kernel(int N, float *u, float *v, float *p, float *d
     }
 }
 
-__global__ void project_update_kernel(int N, float *u, float *v, float *p,
-                                      unsigned char *solid) {
+__global__ void project_update_kernel(int N,
+                                      float *__restrict__ u,
+                                      float *__restrict__ v,
+                                      const float *__restrict__ p,
+                                      const unsigned char *__restrict__ solid) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     if (i >= 1 && i <= N && j >= 1 && j <= N) {
@@ -299,9 +337,7 @@ void vel_step(int N, float *u, float *v, float *u0, float *v0,
               float visc, float dt, unsigned char *solid) {
     dim3 threads(16, 16);
     dim3 blocks((N + 2 + 15) / 16, (N + 2 + 15) / 16);
-    add_source_kernel<<<blocks, threads>>>(N, u, u0, dt);
-    CUDA_CHECK(cudaPeekAtLastError());
-    add_source_kernel<<<blocks, threads>>>(N, v, v0, dt);
+    add_velocity_source_kernel<<<blocks, threads>>>(N, u, v, u0, v0, dt);
     CUDA_CHECK(cudaPeekAtLastError());
     apply_solid_velocity(N, u, v, solid);
     SWAP(u0, u);

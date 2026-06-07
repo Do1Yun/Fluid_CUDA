@@ -46,7 +46,7 @@ if (-not $cl) {
 }
 
 $args = @(
-    "-O3", "-std=c++17", "-Wno-deprecated-gpu-targets",
+    "-O3", "--use_fast_math", "-std=c++17", "-Wno-deprecated-gpu-targets",
     "-Xcompiler", "/utf-8,/wd4828",
     "-I$glutInclude",
     "main.cu", "solver3d.cu",

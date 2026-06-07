@@ -31,6 +31,7 @@ static float visc = 0.0f;
 static float dissipation = 0.995f;
 static float force  = 5.0f;
 static float source = 100.0f;
+static float auto_smoke_velocity = -0.75f;
 static int brush_cells_divisor = 64;
 static float smoke_color_speed_scale = 0.55f;
 static float velocity_vis_scale = 0.70f;
@@ -425,7 +426,7 @@ static void add_auto_smoke(float *d, float *v_) {
             float falloff = 1.0f - dist2 * inv_radius2;
             int idx = IX(ii, jj);
             d[idx] += source * falloff;
-            v_[idx] += -2.0f * falloff;
+            v_[idx] += auto_smoke_velocity * falloff;
         }
     }
 }
