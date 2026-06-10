@@ -9,10 +9,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <time.h>
+#include <wchar.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
 #else
 #include <time.h>
+#include <sys/stat.h>
 #endif
 #include <cuda_runtime.h>
 
@@ -79,6 +84,15 @@ static double step_accum   = 0.0;
 static double last_fps_time = 0.0;
 static double current_fps  = 0.0;
 static double current_step_ms = 0.0;
+
+typedef struct BenchmarkConfig {
+    int enabled;
+    int frames;
+    int warmup;
+    int grid_size;
+    char tag[32];
+    int save_csv;
+} BenchmarkConfig;
 
 #define IX(i, j) ((i) + (N + 2) * (j))
 #define SWAP(x0, x) { float *tmp = x0; x0 = x; x = tmp; }
@@ -711,7 +725,344 @@ static void prompt_grid_size(void) {
     N = value;
 }
 
+static void init_benchmark_config(BenchmarkConfig *cfg) {
+    cfg->enabled = 0;
+    cfg->frames = 240;
+    cfg->warmup = 30;
+    cfg->grid_size = 256;
+    strcpy(cfg->tag, "default");
+    cfg->save_csv = 1;
+}
+
+static int parse_int_value_arg(const char *arg, const char *prefix, int *out) {
+    size_t len = strlen(prefix);
+    if (strncmp(arg, prefix, len) == 0 && arg[len] == '=') {
+        *out = atoi(arg + len + 1);
+        return 1;
+    }
+    return 0;
+}
+
+static void parse_benchmark_args(int argc, char **argv, BenchmarkConfig *cfg) {
+    init_benchmark_config(cfg);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--benchmark") == 0 || strcmp(argv[i], "-b") == 0) {
+            cfg->enabled = 1;
+        } else if (strcmp(argv[i], "--bench-no-csv") == 0) {
+            cfg->save_csv = 0;
+            cfg->enabled = 1;
+        } else if (strcmp(argv[i], "--bench-frames") == 0 && i + 1 < argc) {
+            cfg->frames = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-warmup") == 0 && i + 1 < argc) {
+            cfg->warmup = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-size") == 0 && i + 1 < argc) {
+            cfg->grid_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--bench-tag") == 0 && i + 1 < argc) {
+            snprintf(cfg->tag, sizeof(cfg->tag), "%s", argv[++i]);
+            cfg->enabled = 1;
+        } else if (parse_int_value_arg(argv[i], "--bench-frames", &cfg->frames) ||
+                   parse_int_value_arg(argv[i], "--bench-warmup", &cfg->warmup) ||
+                   parse_int_value_arg(argv[i], "--bench-size", &cfg->grid_size)) {
+            cfg->enabled = 1;
+        }
+    }
+    if (cfg->frames < 1) cfg->frames = 1;
+    if (cfg->warmup < 0) cfg->warmup = 0;
+    if (cfg->grid_size < 16) cfg->grid_size = 16;
+    if (cfg->grid_size > 2048) cfg->grid_size = 2048;
+}
+
+static int clamp_cell_gpu2d(int value) {
+    if (value < 1) return 1;
+    if (value > N) return N;
+    return value;
+}
+
+static void benchmark_source_params_2d(int frame, int pass,
+                                       int *center_i, int *center_j,
+                                       float *density_value,
+                                       float *du, float *dv) {
+    float phase = ((float)frame + 1.0f) * 0.071f + (float)pass * 2.173f;
+    float sx = (pass == 0) ? sinf(phase) : cosf(phase * 0.83f);
+    float sy = (pass == 0) ? cosf(phase * 0.91f) : sinf(phase * 1.17f);
+    float x = 0.50f + ((pass == 0) ? 0.23f : -0.19f) * sx;
+    float y = 0.50f + ((pass == 0) ? 0.18f : 0.22f) * sy;
+
+    *center_i = clamp_cell_gpu2d((int)(x * (float)N) + 1);
+    *center_j = clamp_cell_gpu2d((int)(y * (float)N) + 1);
+    *density_value = source * ((pass == 0) ? 1.00f : 0.72f);
+    *du = force * (0.90f * cosf(phase * 1.31f) + 0.25f * sinf(phase * 0.47f));
+    *dv = force * (0.90f * sinf(phase * 1.07f) - 0.20f * cosf(phase * 0.73f));
+}
+
+static void launch_benchmark_blob_2d(int center_i, int center_j, int radius,
+                                     float density_value, float du, float dv) {
+    float inv_radius2 = 1.0f / (float)(radius * radius);
+    int side = radius * 2 + 1;
+    dim3 threads(16, 16);
+    dim3 blocks((side + 15) / 16, (side + 15) / 16);
+    add_brush_source_kernel<<<blocks, threads>>>(N, d_dens_prev, d_u_prev, d_v_prev,
+                                                center_i, center_j, radius,
+                                                inv_radius2, du, dv,
+                                                density_value, 1, 1);
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+static void prepare_benchmark_sources_gpu2d(int frame) {
+    int bytes = (N + 2) * (N + 2) * (int)sizeof(float);
+    CUDA_CHECK(cudaMemset(d_dens_prev, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_u_prev, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_v_prev, 0, bytes));
+
+    int radius = N / 32;
+    if (radius < 3) radius = 3;
+    for (int pass = 0; pass < 2; pass++) {
+        int center_i, center_j;
+        float density_value, du, dv;
+        benchmark_source_params_2d(frame, pass, &center_i, &center_j,
+                                   &density_value, &du, &dv);
+        launch_benchmark_blob_2d(center_i, center_j, radius,
+                                 density_value, du, dv);
+    }
+}
+
+static void compute_benchmark_metrics_gpu2d(double *density_sum,
+                                            float *density_max,
+                                            double *velocity_l2,
+                                            double *divergence_l2,
+                                            float *divergence_max) {
+    int bytes = (N + 2) * (N + 2) * (int)sizeof(float);
+    CUDA_CHECK(cudaMemcpy(h_dens, d_dens, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_v, d_v, bytes, cudaMemcpyDeviceToHost));
+
+    double density_accum = 0.0;
+    double velocity_accum = 0.0;
+    double divergence_accum = 0.0;
+    float max_density = 0.0f;
+    float max_divergence = 0.0f;
+    int count = 0;
+
+    for (int j = 1; j <= N; j++) {
+        for (int i = 1; i <= N; i++) {
+            int idx = IX(i, j);
+            float dens_value = h_dens[idx];
+            float speed2 = h_u[idx] * h_u[idx] + h_v[idx] * h_v[idx];
+            float div = 0.5f * (float)N *
+                        (h_u[IX(i + 1, j)] - h_u[IX(i - 1, j)] +
+                         h_v[IX(i, j + 1)] - h_v[IX(i, j - 1)]);
+            float abs_div = fabsf(div);
+
+            density_accum += (double)dens_value;
+            velocity_accum += (double)speed2;
+            divergence_accum += (double)div * (double)div;
+            if (dens_value > max_density) max_density = dens_value;
+            if (abs_div > max_divergence) max_divergence = abs_div;
+            count++;
+        }
+    }
+
+    if (count < 1) count = 1;
+    *density_sum = density_accum;
+    *density_max = max_density;
+    *velocity_l2 = sqrt(velocity_accum / (double)count);
+    *divergence_l2 = sqrt(divergence_accum / (double)count);
+    *divergence_max = max_divergence;
+}
+
+static void make_benchmark_timestamp(char *buffer, size_t size) {
+    time_t raw_time = time(NULL);
+    struct tm local_time;
+#ifdef _WIN32
+    localtime_s(&local_time, &raw_time);
+#else
+    localtime_r(&raw_time, &local_time);
+#endif
+    snprintf(buffer, size, "%04d%02d%02d_%02d%02d%02d",
+             local_time.tm_year + 1900,
+             local_time.tm_mon + 1,
+             local_time.tm_mday,
+             local_time.tm_hour,
+             local_time.tm_min,
+             local_time.tm_sec);
+}
+
+static void write_benchmark_csv_gpu2d(const char *mode,
+                                      const char *input_id,
+                                      const char *tag,
+                                      int grid_size,
+                                      int warmup_frames,
+                                      int measured_frames,
+                                      double source_ms,
+                                      double step_ms,
+                                      double total_ms,
+                                      double fps,
+                                      double density_sum,
+                                      float density_max,
+                                      double velocity_l2,
+                                      double divergence_l2,
+                                      float divergence_max) {
+    char timestamp[32];
+    const char *filename = (strcmp(tag, "scaling") == 0) ?
+        "benchmark_scaling_2d.csv" : "benchmark_2d.csv";
+    make_benchmark_timestamp(timestamp, sizeof(timestamp));
+    long long cells = (long long)grid_size * (long long)grid_size;
+    double scalar_field_mb = ((double)(grid_size + 2) * (double)(grid_size + 2) *
+                              (double)sizeof(float)) / (1024.0 * 1024.0);
+    double mcells_per_sec = (total_ms > 0.0) ?
+        ((double)cells / (total_ms / 1000.0)) / 1000000.0 : 0.0;
+    double ns_per_cell = (cells > 0) ? (total_ms * 1000000.0 / (double)cells) : 0.0;
+
+#ifdef _WIN32
+    wchar_t module_path[MAX_PATH];
+    wchar_t exe_dir[MAX_PATH];
+    wchar_t root_dir[MAX_PATH];
+    wchar_t folder[MAX_PATH];
+    wchar_t wide_filename[160];
+    wchar_t csv_path[MAX_PATH];
+
+    DWORD len = GetModuleFileNameW(NULL, module_path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        fwprintf(stderr, L"WARNING: could not resolve executable path for benchmark CSV\n");
+        return;
+    }
+    wcscpy_s(exe_dir, MAX_PATH, module_path);
+    wchar_t *last_slash = wcsrchr(exe_dir, L'\\');
+    if (!last_slash) last_slash = wcsrchr(exe_dir, L'/');
+    if (last_slash) {
+        *last_slash = L'\0';
+    }
+    wcscpy_s(root_dir, MAX_PATH, exe_dir);
+    last_slash = wcsrchr(root_dir, L'\\');
+    if (!last_slash) last_slash = wcsrchr(root_dir, L'/');
+    if (last_slash) {
+        *last_slash = L'\0';
+    }
+
+    swprintf(folder, MAX_PATH, L"%ls\\benchmark_results", root_dir);
+    if (_wmkdir(folder) != 0 && errno != EEXIST) {
+        fwprintf(stderr, L"WARNING: could not create benchmark folder: %ls\n", folder);
+        return;
+    }
+    MultiByteToWideChar(CP_UTF8, 0, filename, -1, wide_filename, 160);
+    swprintf(csv_path, MAX_PATH, L"%ls\\%ls", folder, wide_filename);
+    int need_header = 1;
+    FILE *probe = _wfopen(csv_path, L"rb");
+    if (probe) {
+        fseek(probe, 0, SEEK_END);
+        need_header = (ftell(probe) == 0);
+        fclose(probe);
+    }
+    FILE *fp = _wfopen(csv_path, L"ab");
+#else
+    const char *folder = "../benchmark_results";
+    if (mkdir(folder, 0777) != 0 && errno != EEXIST) {
+        fprintf(stderr, "WARNING: could not create benchmark folder: %s\n", folder);
+        return;
+    }
+    char csv_path[512];
+    snprintf(csv_path, sizeof(csv_path), "%s/%s", folder, filename);
+    int need_header = 1;
+    FILE *probe = fopen(csv_path, "rb");
+    if (probe) {
+        fseek(probe, 0, SEEK_END);
+        need_header = (ftell(probe) == 0);
+        fclose(probe);
+    }
+    FILE *fp = fopen(csv_path, "ab");
+#endif
+    if (!fp) {
+        fprintf(stderr, "WARNING: could not write benchmark CSV: %s\n", filename);
+        return;
+    }
+
+    if (need_header) {
+        fprintf(fp, "timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
+    }
+    fprintf(fp, "%s,2d,%s,%s,%d,2,%lld,%.6f,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+            timestamp, mode, input_id, grid_size, cells, scalar_field_mb,
+            warmup_frames, measured_frames,
+            source_ms, step_ms, total_ms, fps,
+            mcells_per_sec, ns_per_cell,
+            density_sum, density_max, velocity_l2,
+            divergence_l2, divergence_max);
+    fclose(fp);
+
+    printf("benchmark_csv,benchmark_results/%s\n", filename);
+}
+
+static int run_benchmark_gpu2d(const BenchmarkConfig *cfg) {
+    N = cfg->grid_size;
+    printf("=== Stable Fluids 2D (GPU/CUDA benchmark) ===\n");
+    printf("Benchmark input: deterministic_2d_v1, no GLUT, no user input\n");
+    printf("Grid: N=%d, warmup=%d, frames=%d\n", N, cfg->warmup, cfg->frames);
+
+    if (!allocate_data()) return 1;
+    clear_obstacles();
+    clear_data();
+
+    int total_frames = cfg->warmup + cfg->frames;
+    double source_seconds = 0.0;
+    double step_seconds = 0.0;
+
+    for (int frame = 0; frame < total_frames; frame++) {
+        double source_t0 = now_seconds();
+        prepare_benchmark_sources_gpu2d(frame);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double source_t1 = now_seconds();
+
+        double step_t0 = now_seconds();
+        vel_step(N, d_u, d_v, d_u_prev, d_v_prev, visc, dt, NULL);
+        dens_step(N, d_dens, d_dens_prev, d_u, d_v, diff, dt, NULL);
+        fade_fields(N, d_dens, d_u, d_v, dissipation, 0.99f, NULL);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        double step_t1 = now_seconds();
+
+        if (frame >= cfg->warmup) {
+            source_seconds += source_t1 - source_t0;
+            step_seconds += step_t1 - step_t0;
+        }
+    }
+
+    double density_sum;
+    double velocity_l2;
+    double divergence_l2;
+    float density_max;
+    float divergence_max;
+    compute_benchmark_metrics_gpu2d(&density_sum, &density_max,
+                                    &velocity_l2, &divergence_l2,
+                                    &divergence_max);
+
+    double source_ms = source_seconds * 1000.0 / (double)cfg->frames;
+    double step_ms = step_seconds * 1000.0 / (double)cfg->frames;
+    double total_ms = source_ms + step_ms;
+    double fps = (total_ms > 0.0) ? 1000.0 / total_ms : 0.0;
+
+    printf("benchmark_header,mode,N,warmup,frames,source_ms,step_ms,total_ms,fps,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
+    printf("benchmark_result,gpu2d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+           N, cfg->warmup, cfg->frames,
+           source_ms, step_ms, total_ms, fps,
+           density_sum, density_max, velocity_l2,
+           divergence_l2, divergence_max);
+    if (cfg->save_csv) {
+        write_benchmark_csv_gpu2d("gpu2d", "deterministic_2d_v1",
+                                  cfg->tag, N, cfg->warmup, cfg->frames,
+                                  source_ms, step_ms, total_ms, fps,
+                                  density_sum, density_max, velocity_l2,
+                                  divergence_l2, divergence_max);
+    }
+
+    free_data();
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    BenchmarkConfig bench_cfg;
+    parse_benchmark_args(argc, argv, &bench_cfg);
+    if (bench_cfg.enabled) {
+        return run_benchmark_gpu2d(&bench_cfg);
+    }
+
     glutInit(&argc, argv);
 
     printf("=== Stable Fluids 2D (GPU/CUDA) ===\n");
