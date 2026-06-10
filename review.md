@@ -22,7 +22,8 @@
 
 - `gpu3d/solver3d.cu`는 3D scalar density와 `u/v/w` 속도장을 사용한다.
 - projection과 diffusion은 3D Jacobi 20회 반복이다.
-- viewer는 매 프레임 density/u/v/w 전체를 Host로 읽어 와 CPU OpenGL immediate mode로 slice/volume 샘플을 그린다.
+- viewer는 CUDA ray marching으로 기본 volume을 렌더링한다. 기본 출력에서는 density/u/v/w 전체 Host readback을 하지 않고, raymarch 결과 RGBA buffer만 OpenGL texture로 업로드한다.
+- 기본 데모는 6면체 박스 안에서 상단 중앙의 고정 원형 smoke inlet이 아래로 바람을 넣고, 이동 가능한 구형 물체에 부딪힌 연기가 퍼지는 풍동 형태이다.
 
 ## 2. 어색하거나 올바르지 못한 지점
 
@@ -36,7 +37,7 @@
 
 - solid scalar를 0으로 고정하지 않고 주변 평균으로 채우는 방식은 샘플링 안정성에는 도움이 되지만, smoke가 벽 내부에 숨어 있다가 obstacle 삭제 후 다시 나타나는 느낌을 줄 수 있다.
 - solid 근처 projection은 이웃 solid velocity를 0으로 간주한다. 간단한 마스크 처리로는 충분하지만 복잡한 obstacle 경계에서는 압력 경계가 거칠다.
-- 2D 자동 smoke source는 현재 `auto_smoke_velocity = -0.75f`라 화면 좌표 기준으로 완만한 아래쪽 흐름을 만든다. 3D 자동 source는 `v += +1.7f`라 위쪽 흐름이다. 의도된 연출이 아니라면 2D도 위로 올라가게 통일하는 편이 자연스럽다.
+- 2D 자동 smoke source는 현재 `auto_smoke_velocity = -0.75f`라 화면 좌표 기준으로 완만한 아래쪽 흐름을 만든다. 3D 자동 source는 상단 중앙에 고정된 원형 inlet에서 아래 방향으로 흐른다.
 
 ### Advection 품질
 
@@ -72,6 +73,15 @@
 ### GPU 3D
 
 - `u/v/w` source add를 하나의 fused kernel로 합쳤다.
+- 3D 기본 자동 source를 켜고, 박스 상단 중앙에 고정된 원형 smoke inlet에서 아래로 흐르도록 변경했다. 마우스 휠은 source 위치를 바꾸지 않는다.
+- 3D viewer의 도메인 반경을 `domain_half_extent = 1.45f`로 키워 박스 전체 크기를 더 확대했다.
+- smoke source 양, inlet 반경, raymarch alpha를 키워 기본 연기량과 가시성을 높였다.
+- 이동 가능한 구형 장애물을 추가했다. `m` 또는 `tab` 키로 카메라 이동 모드와 물체 이동 모드를 전환하고, 물체 이동 모드에서는 `WASD/QE`로 obstacle 위치를 바꾼다.
+- solver는 현재 obstacle 내부의 density/u/v/w를 0으로 만들고, 장애물 주변 shell에서는 표면 안쪽으로 파고드는 속도 성분을 제거해 연기가 물체를 타고 흐르게 한다.
+- 카메라를 따라오는 z slice, velocity vector, floor grid, 입력 평면 guide는 기본 출력에서 제거했다. 기본 화면에는 smoke volume, 6면체 박스, obstacle, wind inlet marker만 남긴다.
+- 현재 기본 volume은 CUDA ray marching으로 카메라 ray와 6면체 박스의 교차 구간을 적분해 렌더링한다. 화면정렬 billboard/slice-stack 방식은 사용하지 않는다.
+- obstacle을 먼저 그린 뒤, raymarch 커널이 obstacle 전면 hit 지점까지만 연기를 적분해 합성한다. 따라서 연기가 물체보다 카메라에 가까운 경우에는 연기가 물체를 가리고, 물체 뒤쪽 연기는 물체 위에 잘못 덮이지 않는다.
+- CUDA raymarch 카메라와 OpenGL 박스/장애물 카메라는 같은 FOV, near/far, forward/right/up frame을 사용해야 한다. OpenGL `gluLookAt`도 world-up 고정값이 아니라 `camera_basis()`의 up vector를 사용한다. 매 frame viewport/projection/render state를 명시적으로 재설정한다.
 - `gpu3d/build.ps1`에 `--use_fast_math`를 추가했다.
 
 ## 4. 이후 수정 명세
@@ -98,10 +108,10 @@
 ### GPU 렌더링/전송
 
 - 2D는 다음 단계에서 CUDA/OpenGL PBO interop로 `d_density_pixels -> h_density_pixels -> glTexSubImage2D` 복사를 제거한다.
-- 3D는 반드시 CUDA/OpenGL interop 또는 3D texture 기반 렌더링으로 전환한다.
-  - density를 CUDA array 또는 3D texture에 올린다.
-  - slice/volume 렌더링은 shader/ray marching으로 처리한다.
-  - CPU readback은 디버그/검증 모드에서만 허용한다.
+- 3D는 다음 단계에서 CUDA/OpenGL PBO interop 또는 OpenGL 3D texture 기반 렌더링으로 전환한다.
+  - 현재 CUDA ray marching 결과는 2D RGBA buffer로 만든 뒤 Host를 거쳐 OpenGL texture로 업로드한다.
+  - 다음 단계에서는 CUDA output buffer를 PBO로 직접 연결해 `d_volume_pixels -> h_volume_pixels -> glTexSubImage2D` 복사를 제거한다.
+  - density/u/v/w 전체 Host readback은 기본 출력에서 금지하고, 별도 디버그/검증 모드에서만 허용한다.
 - advection sampling은 CUDA texture object를 검토한다. hardware interpolation을 쓰면 bilinear/trilinear 샘플 코드와 global load 수를 줄일 수 있다.
 - 필요한 Host 전송이 남는 경우 pinned host memory와 async copy/stream을 사용한다.
 

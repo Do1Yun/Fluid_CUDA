@@ -13,5 +13,8 @@ void vel_step3d(int n, float *d_u, float *d_v, float *d_w,
 void fade_fields3d(int n, float *d_dens,
                    float *d_u, float *d_v, float *d_w,
                    float dissipation, float vel_damping);
+void apply_sphere_obstacle3d(int n, float *d_dens,
+                             float *d_u, float *d_v, float *d_w,
+                             float cx, float cy, float cz, float radius);
 
 #endif

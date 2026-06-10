@@ -52,7 +52,7 @@ $args = @(
     "main.cu", "solver3d.cu",
     "-o", "fluid3d_gpu.exe",
     "-L$glutLib",
-    "freeglut.lib", "opengl32.lib", "glu32.lib"
+    "freeglut.lib", "opengl32.lib", "glu32.lib", "user32.lib"
 )
 
 Write-Host "nvcc $($args -join ' ')"

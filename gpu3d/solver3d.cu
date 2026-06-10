@@ -319,3 +319,54 @@ void fade_fields3d(int N, float *dens, float *u, float *v, float *w,
                                               dissipation, vel_damping);
     CUDA_CHECK(cudaPeekAtLastError());
 }
+
+__global__ void sphere_obstacle_kernel3d(int N,
+                                         float *__restrict__ dens,
+                                         float *__restrict__ u,
+                                         float *__restrict__ v,
+                                         float *__restrict__ w,
+                                         float cx, float cy, float cz,
+                                         float radius) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int k = blockIdx.z * blockDim.z + threadIdx.z;
+    if (i < 1 || i > N || j < 1 || j > N || k < 1 || k > N) return;
+
+    float dx = (float)i - cx;
+    float dy = (float)j - cy;
+    float dz = (float)k - cz;
+    float dist2 = dx * dx + dy * dy + dz * dz;
+    float r2 = radius * radius;
+    int idx = IX3(i, j, k);
+
+    if (dist2 <= r2) {
+        dens[idx] = 0.0f;
+        u[idx] = 0.0f;
+        v[idx] = 0.0f;
+        w[idx] = 0.0f;
+        return;
+    }
+
+    float shell = radius + 3.0f;
+    if (dist2 <= shell * shell) {
+        float inv_dist = rsqrtf(dist2);
+        float nx = dx * inv_dist;
+        float ny = dy * inv_dist;
+        float nz = dz * inv_dist;
+        float inward = u[idx] * nx + v[idx] * ny + w[idx] * nz;
+        if (inward < 0.0f) {
+            u[idx] -= inward * nx;
+            v[idx] -= inward * ny;
+            w[idx] -= inward * nz;
+        }
+    }
+}
+
+void apply_sphere_obstacle3d(int N, float *dens, float *u, float *v, float *w,
+                             float cx, float cy, float cz, float radius) {
+    dim3 threads(8, 8, 4);
+    dim3 blocks((N + 2 + 7) / 8, (N + 2 + 7) / 8, (N + 2 + 3) / 4);
+    sphere_obstacle_kernel3d<<<blocks, threads>>>(N, dens, u, v, w,
+                                                  cx, cy, cz, radius);
+    CUDA_CHECK(cudaPeekAtLastError());
+}

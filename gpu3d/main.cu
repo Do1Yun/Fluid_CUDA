@@ -1,4 +1,4 @@
-// 3D Stable Fluids - GPU slice viewer
+// 3D Stable Fluids - GPU wind tunnel viewer
 
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -37,29 +37,40 @@ static int N = 64;
 static float dt = 0.08f;
 static float diff = 0.0f;
 static float visc = 0.0f;
-static float dissipation = 0.992f;
-static float source = 180.0f;
-static float force = 3.5f;
+static float dissipation = 0.997f;
+static float source = 420.0f;
 static float color_speed_scale = 0.55f;
+static float domain_half_extent = 1.45f;
+static float auto_flow_speed = 1.15f;
+static float obstacle_radius_world = 0.28f;
+static float obstacle_x = 0.0f, obstacle_y = 0.0f, obstacle_z = 0.0f;
+static float obstacle_move_speed = 0.045f;
+static float wind_source_radius_world = 0.38f;
+static float wind_source_depth_world = 0.30f;
+static int control_mode = 0;  /* 0: camera, 1: obstacle */
+static const float camera_fov_degrees = 58.0f;
+static const float camera_near_clip = 0.01f;
+static const float camera_far_clip = 100.0f;
+static const float pi_f = 3.14159265f;
 
-static float *h_dens, *h_dens_prev;
-static float *h_u, *h_v, *h_w, *h_u_prev, *h_v_prev, *h_w_prev;
+static float *h_dens_prev;
+static float *h_u_prev, *h_v_prev, *h_w_prev;
 static float *d_dens, *d_dens_prev;
 static float *d_u, *d_v, *d_w, *d_u_prev, *d_v_prev, *d_w_prev;
+static unsigned char *h_volume_pixels;
+static uchar4 *d_volume_pixels;
+static GLuint volume_tex = 0;
+static int volume_tex_w = 0;
+static int volume_tex_h = 0;
 
 static int win_x = 900, win_y = 760;
-static int mx, my, omx, omy;
-static int mouse_down[3];
+static int mx, my;
 static int paused = 0;
-static float camera_slice_offset = 0.0f;
-static int show_vectors = 1;
-static int show_slice = 1;
 static int show_volume = 1;
-static int auto_source = 0;
-static float last_inject_pos[3] = {0.0f, 0.0f, 0.0f};
-static int has_inject_pos = 0;
+static int auto_source = 1;
+static int mode_toggle_down = 0;
 
-static float cam_x = 0.0f, cam_y = 0.0f, cam_z = 2.2f;
+static float cam_x = 0.0f, cam_y = 0.0f, cam_z = 4.2f;
 static float cam_yaw = 0.0f, cam_pitch = 0.0f;
 static float cam_speed = 0.08f;
 static int right_look = 0;
@@ -73,7 +84,79 @@ static double current_fps = 0.0;
 
 #define IX3(i, j, k) ((i) + (N + 2) * ((j) + (N + 2) * (k)))
 
-static float cell_coord(int index);
+static float domain_size(void) {
+    return domain_half_extent * 2.0f;
+}
+
+static float clamp_float(float value, float lo, float hi) {
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+static float obstacle_radius_cells(void) {
+    return obstacle_radius_world / domain_size() * (float)N;
+}
+
+static float world_to_cell_coord(float p) {
+    return ((p + domain_half_extent) / domain_size()) * (float)N + 1.0f;
+}
+
+static int world_to_cell_index(float p) {
+    int cell = (int)(((p + domain_half_extent) / domain_size()) * (float)N) + 1;
+    if (cell < 1) cell = 1;
+    if (cell > N) cell = N;
+    return cell;
+}
+
+static float cell_to_world_coord(int index) {
+    float t = ((float)index - 0.5f) / (float)N;
+    return -domain_half_extent + t * domain_size();
+}
+
+static void clamp_obstacle_position(void) {
+    float limit = domain_half_extent - obstacle_radius_world;
+    obstacle_x = clamp_float(obstacle_x, -limit, limit);
+    obstacle_y = clamp_float(obstacle_y, -limit, limit);
+    obstacle_z = clamp_float(obstacle_z, -limit, limit);
+}
+
+static void toggle_control_mode(void) {
+    control_mode = 1 - control_mode;
+    printf("Control mode: %s\n", control_mode == 0 ? "camera" : "object");
+}
+
+static void poll_mode_toggle_key(void) {
+#ifdef _WIN32
+    int down = ((GetAsyncKeyState('M') & 0x8000) != 0) ||
+               ((GetAsyncKeyState(VK_TAB) & 0x8000) != 0);
+    if (down && !mode_toggle_down) {
+        toggle_control_mode();
+    }
+    mode_toggle_down = down;
+#endif
+}
+
+static void wind_source_frame(float center[3], float dir[3],
+                              float tangent[3], float bitangent[3]) {
+    float half_depth = wind_source_depth_world * 0.5f;
+
+    center[0] = 0.0f;
+    center[1] = domain_half_extent - half_depth;
+    center[2] = 0.0f;
+
+    dir[0] = 0.0f;
+    dir[1] = -1.0f;
+    dir[2] = 0.0f;
+
+    tangent[0] = 1.0f;
+    tangent[1] = 0.0f;
+    tangent[2] = 0.0f;
+
+    bitangent[0] = 0.0f;
+    bitangent[1] = 0.0f;
+    bitangent[2] = 1.0f;
+}
 
 static void camera_basis(float *forward, float *right, float *up) {
     float cp = cosf(cam_pitch);
@@ -88,57 +171,6 @@ static void camera_basis(float *forward, float *right, float *up) {
     up[0] = right[1] * forward[2] - right[2] * forward[1];
     up[1] = right[2] * forward[0] - right[0] * forward[2];
     up[2] = right[0] * forward[1] - right[1] * forward[0];
-}
-
-static void camera_plane_center(float *center) {
-    float forward[3], right[3], up[3];
-    camera_basis(forward, right, up);
-
-    center[0] = forward[0] * camera_slice_offset;
-    center[1] = forward[1] * camera_slice_offset;
-    center[2] = forward[2] * camera_slice_offset;
-}
-
-static int screen_to_camera_plane(int x, int y, float *out) {
-    float forward[3], right[3], up[3], center[3];
-    camera_basis(forward, right, up);
-    camera_plane_center(center);
-
-    float aspect = (win_y > 0) ? (float)win_x / (float)win_y : 1.0f;
-    float fov = 58.0f * 3.14159265f / 180.0f;
-    float tan_half = tanf(fov * 0.5f);
-    float sx = ((float)x / (float)(win_x > 0 ? win_x : 1)) * 2.0f - 1.0f;
-    float sy = 1.0f - ((float)y / (float)(win_y > 0 ? win_y : 1)) * 2.0f;
-
-    float ray[3] = {
-        forward[0] + right[0] * sx * tan_half * aspect + up[0] * sy * tan_half,
-        forward[1] + right[1] * sx * tan_half * aspect + up[1] * sy * tan_half,
-        forward[2] + right[2] * sx * tan_half * aspect + up[2] * sy * tan_half
-    };
-    float inv_len = 1.0f / sqrtf(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
-    ray[0] *= inv_len;
-    ray[1] *= inv_len;
-    ray[2] *= inv_len;
-
-    float denom = ray[0] * forward[0] + ray[1] * forward[1] + ray[2] * forward[2];
-    if (fabsf(denom) <= 0.0001f) return 0;
-    float numer = ((center[0] - cam_x) * forward[0] +
-                   (center[1] - cam_y) * forward[1] +
-                   (center[2] - cam_z) * forward[2]);
-    float t = numer / denom;
-    if (t <= 0.0f) return 0;
-
-    out[0] = cam_x + ray[0] * t;
-    out[1] = cam_y + ray[1] * t;
-    out[2] = cam_z + ray[2] * t;
-    return 1;
-}
-
-static int world_to_cell(float p) {
-    int cell = (int)((p + 0.5f) * (float)N) + 1;
-    if (cell < 1) cell = 1;
-    if (cell > N) cell = N;
-    return cell;
 }
 
 static double now_seconds(void) {
@@ -159,75 +191,129 @@ static size_t volume_count(void) {
     return (size_t)(N + 2) * (N + 2) * (N + 2);
 }
 
-static void clear_host_sources(void) {
-    size_t bytes = volume_count() * sizeof(float);
-    memset(h_dens_prev, 0, bytes);
-    memset(h_u_prev, 0, bytes);
-    memset(h_v_prev, 0, bytes);
-    memset(h_w_prev, 0, bytes);
+__device__ static float clamp01_device(float x) {
+    return fminf(fmaxf(x, 0.0f), 1.0f);
 }
 
-static void clear_data(void) {
-    size_t bytes = volume_count() * sizeof(float);
-    memset(h_dens, 0, bytes);
-    memset(h_u, 0, bytes);
-    memset(h_v, 0, bytes);
-    memset(h_w, 0, bytes);
-    clear_host_sources();
-    CUDA_CHECK(cudaMemset(d_dens, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_u, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_v, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_w, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_dens_prev, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_u_prev, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_v_prev, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_w_prev, 0, bytes));
+__device__ static float3 add3_device(float3 a, float3 b) {
+    return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
 
-static int allocate_data(void) {
-    size_t bytes = volume_count() * sizeof(float);
-    h_dens = (float *)malloc(bytes);
-    h_dens_prev = (float *)malloc(bytes);
-    h_u = (float *)malloc(bytes);
-    h_v = (float *)malloc(bytes);
-    h_w = (float *)malloc(bytes);
-    h_u_prev = (float *)malloc(bytes);
-    h_v_prev = (float *)malloc(bytes);
-    h_w_prev = (float *)malloc(bytes);
-    if (!h_dens || !h_dens_prev || !h_u || !h_v || !h_w ||
-        !h_u_prev || !h_v_prev || !h_w_prev) {
-        fprintf(stderr, "ERROR: out of host memory\n");
-        return 0;
+__device__ static float3 sub3_device(float3 a, float3 b) {
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+__device__ static float3 mul3_device(float3 a, float s) {
+    return make_float3(a.x * s, a.y * s, a.z * s);
+}
+
+__device__ static float dot3_device(float3 a, float3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+__device__ static float3 normalize3_device(float3 v) {
+    float len2 = dot3_device(v, v);
+    if (len2 <= 1.0e-12f) return make_float3(0.0f, 0.0f, -1.0f);
+    float inv_len = rsqrtf(len2);
+    return mul3_device(v, inv_len);
+}
+
+__device__ static int intersect_box_device(float3 origin, float3 dir,
+                                          float half_extent,
+                                          float *t_near, float *t_far) {
+    float t0 = -1.0e20f;
+    float t1 =  1.0e20f;
+    float o[3] = {origin.x, origin.y, origin.z};
+    float d[3] = {dir.x, dir.y, dir.z};
+
+    for (int axis = 0; axis < 3; axis++) {
+        if (fabsf(d[axis]) < 1.0e-7f) {
+            if (o[axis] < -half_extent || o[axis] > half_extent) return 0;
+            continue;
+        }
+        float inv_d = 1.0f / d[axis];
+        float a = (-half_extent - o[axis]) * inv_d;
+        float b = ( half_extent - o[axis]) * inv_d;
+        if (a > b) {
+            float tmp = a;
+            a = b;
+            b = tmp;
+        }
+        if (a > t0) t0 = a;
+        if (b < t1) t1 = b;
+        if (t0 > t1) return 0;
     }
 
-    CUDA_CHECK(cudaMalloc(&d_dens, bytes));
-    CUDA_CHECK(cudaMalloc(&d_dens_prev, bytes));
-    CUDA_CHECK(cudaMalloc(&d_u, bytes));
-    CUDA_CHECK(cudaMalloc(&d_v, bytes));
-    CUDA_CHECK(cudaMalloc(&d_w, bytes));
-    CUDA_CHECK(cudaMalloc(&d_u_prev, bytes));
-    CUDA_CHECK(cudaMalloc(&d_v_prev, bytes));
-    CUDA_CHECK(cudaMalloc(&d_w_prev, bytes));
-    init_solver3d(N);
+    *t_near = t0;
+    *t_far = t1;
+    return t1 > 0.0f;
+}
+
+__device__ static int intersect_sphere_device(float3 origin, float3 dir,
+                                             float3 center, float radius,
+                                             float *t_hit) {
+    float3 oc = sub3_device(origin, center);
+    float b = dot3_device(oc, dir);
+    float c = dot3_device(oc, oc) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0f) return 0;
+
+    float s = sqrtf(disc);
+    float t = -b - s;
+    if (t < 0.0f) t = -b + s;
+    if (t < 0.0f) return 0;
+
+    *t_hit = t;
     return 1;
 }
 
-static void free_data(void) {
-    free(h_dens); free(h_dens_prev);
-    free(h_u); free(h_v); free(h_w);
-    free(h_u_prev); free(h_v_prev); free(h_w_prev);
-    CUDA_CHECK(cudaFree(d_dens));
-    CUDA_CHECK(cudaFree(d_dens_prev));
-    CUDA_CHECK(cudaFree(d_u));
-    CUDA_CHECK(cudaFree(d_v));
-    CUDA_CHECK(cudaFree(d_w));
-    CUDA_CHECK(cudaFree(d_u_prev));
-    CUDA_CHECK(cudaFree(d_v_prev));
-    CUDA_CHECK(cudaFree(d_w_prev));
-    free_solver3d();
+__device__ static float sample_field_trilinear_device(int N,
+                                                      const float *__restrict__ field,
+                                                      float3 p,
+                                                      float half_extent) {
+    float domain = half_extent * 2.0f;
+    float gx = ((p.x + half_extent) / domain) * (float)N + 0.5f;
+    float gy = ((p.y + half_extent) / domain) * (float)N + 0.5f;
+    float gz = ((p.z + half_extent) / domain) * (float)N + 0.5f;
+
+    gx = fminf(fmaxf(gx, 1.0f), (float)N);
+    gy = fminf(fmaxf(gy, 1.0f), (float)N);
+    gz = fminf(fmaxf(gz, 1.0f), (float)N);
+
+    int x0 = (int)floorf(gx);
+    int y0 = (int)floorf(gy);
+    int z0 = (int)floorf(gz);
+    if (x0 >= N) x0 = N - 1;
+    if (y0 >= N) y0 = N - 1;
+    if (z0 >= N) z0 = N - 1;
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    int z1 = z0 + 1;
+
+    float tx = gx - (float)x0;
+    float ty = gy - (float)y0;
+    float tz = gz - (float)z0;
+
+    float c000 = field[IX3(x0, y0, z0)];
+    float c100 = field[IX3(x1, y0, z0)];
+    float c010 = field[IX3(x0, y1, z0)];
+    float c110 = field[IX3(x1, y1, z0)];
+    float c001 = field[IX3(x0, y0, z1)];
+    float c101 = field[IX3(x1, y0, z1)];
+    float c011 = field[IX3(x0, y1, z1)];
+    float c111 = field[IX3(x1, y1, z1)];
+
+    float c00 = c000 + (c100 - c000) * tx;
+    float c10 = c010 + (c110 - c010) * tx;
+    float c01 = c001 + (c101 - c001) * tx;
+    float c11 = c011 + (c111 - c011) * tx;
+    float c0 = c00 + (c10 - c00) * ty;
+    float c1 = c01 + (c11 - c01) * ty;
+    return c0 + (c1 - c0) * tz;
 }
 
-static void hsv_to_rgb(float h, float s, float v, float *r, float *g, float *b) {
+__device__ static void hsv_to_rgb_device(float h, float s, float v,
+                                         float *r, float *g, float *b) {
     float c = v * s;
     float x = c * (1.0f - fabsf(fmodf(h * 6.0f, 2.0f) - 1.0f));
     float m = v - c;
@@ -246,55 +332,242 @@ static void hsv_to_rgb(float h, float s, float v, float *r, float *g, float *b) 
     *b = bp + m;
 }
 
-static void smoke_rgba(float dens, float u, float v, float w,
-                       float alpha_scale,
-                       float *r, float *g, float *b, float *a) {
-    float visual_dens = 1.0f - expf(-dens * 0.18f);
-    if (visual_dens < 0.0f) visual_dens = 0.0f;
-    if (visual_dens > 1.0f) visual_dens = 1.0f;
-    float speed = sqrtf(u * u + v * v + w * w);
-    float t = 1.0f - expf(-speed * color_speed_scale);
-    if (t > 1.0f) t = 1.0f;
+__global__ void raymarch_volume_kernel(int N,
+                                       const float *__restrict__ dens,
+                                       const float *__restrict__ u,
+                                       const float *__restrict__ v,
+                                       const float *__restrict__ w,
+                                       uchar4 *__restrict__ pixels,
+                                       int width, int height,
+                                       float3 cam_pos,
+                                       float3 forward,
+                                       float3 right,
+                                       float3 up,
+                                       float tan_half_fov,
+                                       float aspect,
+                                       float half_extent,
+                                       float color_speed_scale,
+                                       float3 obstacle_center,
+                                       float obstacle_radius) {
+    int px = blockIdx.x * blockDim.x + threadIdx.x;
+    int py = blockIdx.y * blockDim.y + threadIdx.y;
+    if (px >= width || py >= height) return;
 
-    float tint_r, tint_g, tint_b;
-    hsv_to_rgb(0.58f - 0.48f * t, 0.78f, 1.0f, &tint_r, &tint_g, &tint_b);
-    float shade = visual_dens * (0.72f + 0.28f * t);
-    float tint = 0.10f + 0.42f * t;
-    *r = shade * ((1.0f - tint) + tint * tint_r);
-    *g = shade * ((1.0f - tint) + tint * tint_g);
-    *b = shade * ((1.0f - tint) + tint * tint_b);
-    *a = visual_dens * alpha_scale;
-    if (*a > 0.70f) *a = 0.70f;
+    float sx = (((float)px + 0.5f) / (float)width) * 2.0f - 1.0f;
+    float sy = (((float)py + 0.5f) / (float)height) * 2.0f - 1.0f;
+    float3 ray = add3_device(forward,
+                             add3_device(mul3_device(right, sx * tan_half_fov * aspect),
+                                         mul3_device(up, sy * tan_half_fov)));
+    ray = normalize3_device(ray);
+
+    float t0, t1;
+    int out_idx = py * width + px;
+    if (!intersect_box_device(cam_pos, ray, half_extent, &t0, &t1)) {
+        pixels[out_idx] = make_uchar4(0, 0, 0, 0);
+        return;
+    }
+    if (t0 < 0.0f) t0 = 0.0f;
+
+    float t_obstacle;
+    if (intersect_sphere_device(cam_pos, ray, obstacle_center,
+                                obstacle_radius, &t_obstacle) &&
+        t_obstacle > t0 && t_obstacle < t1) {
+        t1 = t_obstacle;
+    }
+
+    float cell = (half_extent * 2.0f) / (float)N;
+    float step = cell * 0.58f;
+    float alpha = 0.0f;
+    float3 color = make_float3(0.0f, 0.0f, 0.0f);
+
+    for (float t = t0; t <= t1 && alpha < 0.985f; t += step) {
+        float3 p = add3_device(cam_pos, mul3_device(ray, t));
+        float density = sample_field_trilinear_device(N, dens, p, half_extent);
+        if (density <= 0.001f) continue;
+
+        float vx = sample_field_trilinear_device(N, u, p, half_extent);
+        float vy = sample_field_trilinear_device(N, v, p, half_extent);
+        float vz = sample_field_trilinear_device(N, w, p, half_extent);
+        float speed = sqrtf(vx * vx + vy * vy + vz * vz);
+        float vel_t = clamp01_device(1.0f - expf(-speed * color_speed_scale));
+
+        float tint_r, tint_g, tint_b;
+        hsv_to_rgb_device(0.58f - 0.48f * vel_t, 0.78f, 1.0f,
+                          &tint_r, &tint_g, &tint_b);
+        float tint = 0.10f + 0.42f * vel_t;
+        float brightness = clamp01_device(0.62f + 0.30f * vel_t);
+        float sr = brightness * ((1.0f - tint) + tint * tint_r);
+        float sg = brightness * ((1.0f - tint) + tint * tint_g);
+        float sb = brightness * ((1.0f - tint) + tint * tint_b);
+
+        float sample_alpha = 1.0f - expf(-density * 0.0075f * (step / cell));
+        sample_alpha = fminf(sample_alpha, 0.14f);
+        float trans = (1.0f - alpha) * sample_alpha;
+        color.x += trans * sr;
+        color.y += trans * sg;
+        color.z += trans * sb;
+        alpha += trans;
+    }
+
+    float inv_alpha = (alpha > 0.0001f) ? (1.0f / alpha) : 0.0f;
+    unsigned char r = (unsigned char)(clamp01_device(color.x * inv_alpha) * 255.0f + 0.5f);
+    unsigned char g = (unsigned char)(clamp01_device(color.y * inv_alpha) * 255.0f + 0.5f);
+    unsigned char b = (unsigned char)(clamp01_device(color.z * inv_alpha) * 255.0f + 0.5f);
+    unsigned char a = (unsigned char)(clamp01_device(alpha) * 255.0f + 0.5f);
+    pixels[out_idx] = make_uchar4(r, g, b, a);
 }
 
-static void set_smoke_color(float dens, float u, float v, float w, float alpha_scale) {
-    float r, g, b, a;
-    smoke_rgba(dens, u, v, w, alpha_scale, &r, &g, &b, &a);
-    glColor4f(r, g, b, a);
+static void clear_host_sources(void) {
+    size_t bytes = volume_count() * sizeof(float);
+    memset(h_dens_prev, 0, bytes);
+    memset(h_u_prev, 0, bytes);
+    memset(h_v_prev, 0, bytes);
+    memset(h_w_prev, 0, bytes);
 }
 
-static void add_spherical_source(float *dens, float *u, float *v, float *w) {
-    int cx = N / 2 + 1;
-    int cy = N / 2 + 1;
-    int cz = N / 2 + 1;
-    int radius = N / 10;
-    if (radius < 3) radius = 3;
-    float inv_r2 = 1.0f / (float)(radius * radius);
+static void clear_data(void) {
+    size_t bytes = volume_count() * sizeof(float);
+    clear_host_sources();
+    CUDA_CHECK(cudaMemset(d_dens, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_u, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_v, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_w, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_dens_prev, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_u_prev, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_v_prev, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_w_prev, 0, bytes));
+}
 
-    for (int k = cz - radius; k <= cz + radius; k++) {
-        if (k < 1 || k > N) continue;
-        for (int j = cy - radius; j <= cy + radius; j++) {
-            if (j < 1 || j > N) continue;
-            for (int i = cx - radius; i <= cx + radius; i++) {
-                if (i < 1 || i > N) continue;
-                int dx = i - cx, dy = j - cy, dz = k - cz;
-                float dist2 = (float)(dx * dx + dy * dy + dz * dz);
-                if (dist2 > (float)(radius * radius)) continue;
-                float falloff = 1.0f - dist2 * inv_r2;
+static int allocate_data(void) {
+    size_t bytes = volume_count() * sizeof(float);
+    h_dens_prev = (float *)malloc(bytes);
+    h_u_prev = (float *)malloc(bytes);
+    h_v_prev = (float *)malloc(bytes);
+    h_w_prev = (float *)malloc(bytes);
+    if (!h_dens_prev || !h_u_prev || !h_v_prev || !h_w_prev) {
+        fprintf(stderr, "ERROR: out of host memory\n");
+        return 0;
+    }
+
+    CUDA_CHECK(cudaMalloc(&d_dens, bytes));
+    CUDA_CHECK(cudaMalloc(&d_dens_prev, bytes));
+    CUDA_CHECK(cudaMalloc(&d_u, bytes));
+    CUDA_CHECK(cudaMalloc(&d_v, bytes));
+    CUDA_CHECK(cudaMalloc(&d_w, bytes));
+    CUDA_CHECK(cudaMalloc(&d_u_prev, bytes));
+    CUDA_CHECK(cudaMalloc(&d_v_prev, bytes));
+    CUDA_CHECK(cudaMalloc(&d_w_prev, bytes));
+    init_solver3d(N);
+    return 1;
+}
+
+static void release_volume_render_target(void) {
+    free(h_volume_pixels);
+    h_volume_pixels = NULL;
+    if (d_volume_pixels) {
+        CUDA_CHECK(cudaFree(d_volume_pixels));
+        d_volume_pixels = NULL;
+    }
+    if (volume_tex) {
+        glDeleteTextures(1, &volume_tex);
+        volume_tex = 0;
+    }
+    volume_tex_w = 0;
+    volume_tex_h = 0;
+}
+
+static void ensure_volume_render_target(void) {
+    int w_px = (win_x > 1) ? win_x : 1;
+    int h_px = (win_y > 1) ? win_y : 1;
+    if (volume_tex && w_px == volume_tex_w && h_px == volume_tex_h) return;
+
+    release_volume_render_target();
+    size_t pixel_bytes = (size_t)w_px * h_px * 4;
+    h_volume_pixels = (unsigned char *)malloc(pixel_bytes);
+    if (!h_volume_pixels) {
+        fprintf(stderr, "ERROR: out of host memory for volume render target\n");
+        exit(EXIT_FAILURE);
+    }
+    CUDA_CHECK(cudaMalloc(&d_volume_pixels, (size_t)w_px * h_px * sizeof(uchar4)));
+
+    glGenTextures(1, &volume_tex);
+    glBindTexture(GL_TEXTURE_2D, volume_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w_px, h_px, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    volume_tex_w = w_px;
+    volume_tex_h = h_px;
+}
+
+static void free_data(void) {
+    release_volume_render_target();
+    free(h_dens_prev);
+    free(h_u_prev); free(h_v_prev); free(h_w_prev);
+    CUDA_CHECK(cudaFree(d_dens));
+    CUDA_CHECK(cudaFree(d_dens_prev));
+    CUDA_CHECK(cudaFree(d_u));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_w));
+    CUDA_CHECK(cudaFree(d_u_prev));
+    CUDA_CHECK(cudaFree(d_v_prev));
+    CUDA_CHECK(cudaFree(d_w_prev));
+    free_solver3d();
+}
+
+static void add_flow_source(float *dens, float *u, float *v, float *w) {
+    float center[3], dir[3], tangent[3], bitangent[3];
+    wind_source_frame(center, dir, tangent, bitangent);
+
+    float half_depth = wind_source_depth_world * 0.5f;
+    float radius2 = wind_source_radius_world * wind_source_radius_world;
+    float extent = wind_source_radius_world + half_depth;
+    int imin = world_to_cell_index(center[0] - extent);
+    int imax = world_to_cell_index(center[0] + extent);
+    int jmin = world_to_cell_index(center[1] - wind_source_radius_world);
+    int jmax = world_to_cell_index(center[1] + wind_source_radius_world);
+    int kmin = world_to_cell_index(center[2] - extent);
+    int kmax = world_to_cell_index(center[2] + extent);
+    float phase = (float)frame_count * 0.055f;
+
+    for (int j = jmin; j <= jmax; j++) {
+        float py = cell_to_world_coord(j);
+        for (int k = kmin; k <= kmax; k++) {
+            float pz = cell_to_world_coord(k);
+            for (int i = imin; i <= imax; i++) {
+                float px = cell_to_world_coord(i);
+                float dx = px - center[0];
+                float dy = py - center[1];
+                float dz = pz - center[2];
+                float along = dx * dir[0] + dy * dir[1] + dz * dir[2];
+                if (fabsf(along) > half_depth) continue;
+
+                float side = dx * tangent[0] + dy * tangent[1] + dz * tangent[2];
+                float lift = dx * bitangent[0] + dy * bitangent[1] + dz * bitangent[2];
+                float r2 = side * side + lift * lift;
+                if (r2 > radius2) continue;
+
+                float falloff = 1.0f - r2 / radius2;
+                falloff *= falloff;
+                falloff *= 1.0f - fabsf(along) / half_depth;
+                float eddy = sinf(phase + (float)i * 0.075f) *
+                             cosf(phase * 0.73f + (float)k * 0.061f);
+                float swirl = 0.08f * auto_flow_speed * falloff;
+                float eddy2 = 0.04f * sinf(phase * 1.21f + (float)j * 0.23f);
                 int idx = IX3(i, j, k);
-                dens[idx] += source * falloff;
-                v[idx] += 1.7f * falloff;
-                w[idx] += 0.6f * sinf((float)frame_count * 0.08f) * falloff;
+                dens[idx] += source * 0.75f * falloff;
+                u[idx] += (dir[0] * auto_flow_speed +
+                           tangent[0] * (swirl + 0.04f * eddy) +
+                           bitangent[0] * eddy2) * falloff;
+                v[idx] += (dir[1] * auto_flow_speed +
+                           tangent[1] * (swirl + 0.04f * eddy) +
+                           bitangent[1] * eddy2) * falloff;
+                w[idx] += (dir[2] * auto_flow_speed +
+                           tangent[2] * (swirl + 0.04f * eddy) +
+                           bitangent[2] * eddy2) * falloff;
             }
         }
     }
@@ -303,84 +576,30 @@ static void add_spherical_source(float *dens, float *u, float *v, float *w) {
 static void get_from_ui(void) {
     clear_host_sources();
     if (auto_source) {
-        add_spherical_source(h_dens_prev, h_u_prev, h_v_prev, h_w_prev);
+        add_flow_source(h_dens_prev, h_u_prev, h_v_prev, h_w_prev);
     }
-
-    if (!mouse_down[0]) return;
-    float p[3];
-    float forward[3], right[3], up[3];
-    if (!screen_to_camera_plane(mx, my, p)) return;
-    if (p[0] < -0.5f || p[0] > 0.5f ||
-        p[1] < -0.5f || p[1] > 0.5f ||
-        p[2] < -0.5f || p[2] > 0.5f) {
-        return;
-    }
-    camera_basis(forward, right, up);
-    last_inject_pos[0] = p[0];
-    last_inject_pos[1] = p[1];
-    last_inject_pos[2] = p[2];
-    has_inject_pos = 1;
-
-    int i = world_to_cell(p[0]);
-    int j = world_to_cell(p[1]);
-    int k = world_to_cell(p[2]);
-
-    int radius = N / 7;
-    if (radius < 5) radius = 5;
-    float drag_x = (float)(mx - omx);
-    float drag_y = (float)(omy - my);
-    float impulse = force * 0.08f;
-    float du = impulse * (right[0] * drag_x + up[0] * drag_y);
-    float dv = impulse * (right[1] * drag_x + up[1] * drag_y);
-    float dw = impulse * (right[2] * drag_x + up[2] * drag_y);
-
-    float brush_radius = (float)radius / (float)N;
-    float brush_depth = brush_radius * 0.95f;
-    if (brush_depth < 5.0f / (float)N) brush_depth = 5.0f / (float)N;
-    float inv_r2 = 1.0f / (brush_radius * brush_radius);
-    float inv_depth2 = 1.0f / (brush_depth * brush_depth);
-    for (int kk = k - radius; kk <= k + radius; kk++) {
-        if (kk < 1 || kk > N) continue;
-        for (int jj = j - radius; jj <= j + radius; jj++) {
-            if (jj < 1 || jj > N) continue;
-            for (int ii = i - radius; ii <= i + radius; ii++) {
-                if (ii < 1 || ii > N) continue;
-                float dx = cell_coord(ii) - p[0];
-                float dy = cell_coord(jj) - p[1];
-                float dz = cell_coord(kk) - p[2];
-                float plane_x = dx * right[0] + dy * right[1] + dz * right[2];
-                float plane_y = dx * up[0] + dy * up[1] + dz * up[2];
-                float plane_z = dx * forward[0] + dy * forward[1] + dz * forward[2];
-                float volume_r2 = plane_x * plane_x * inv_r2 +
-                                  plane_y * plane_y * inv_r2 +
-                                  plane_z * plane_z * inv_depth2;
-                if (volume_r2 > 1.0f) continue;
-                float falloff = 1.0f - volume_r2;
-                falloff *= falloff;
-                float depth_push = force * 0.12f * falloff;
-                float swirl = force * 0.05f * falloff / brush_radius;
-                int idx = IX3(ii, jj, kk);
-                h_u_prev[idx] += du * falloff + forward[0] * depth_push + (right[0] * plane_y - up[0] * plane_x) * swirl;
-                h_v_prev[idx] += dv * falloff + forward[1] * depth_push + (right[1] * plane_y - up[1] * plane_x) * swirl;
-                h_w_prev[idx] += dw * falloff + forward[2] * depth_push + (right[2] * plane_y - up[2] * plane_x) * swirl;
-                h_dens_prev[idx] += source * falloff;
-            }
-        }
-    }
-    omx = mx;
-    omy = my;
 }
 
-static void update_camera(void) {
+static void update_controls(void) {
     float cy = cosf(cam_yaw), sy = sinf(cam_yaw);
     float fx = sy, fz = -cy;
     float rx = cy, rz = sy;
-    if (keys['w'] || keys['W']) { cam_x += fx * cam_speed; cam_z += fz * cam_speed; }
-    if (keys['s'] || keys['S']) { cam_x -= fx * cam_speed; cam_z -= fz * cam_speed; }
-    if (keys['d'] || keys['D']) { cam_x += rx * cam_speed; cam_z += rz * cam_speed; }
-    if (keys['a'] || keys['A']) { cam_x -= rx * cam_speed; cam_z -= rz * cam_speed; }
-    if (keys['e'] || keys['E']) cam_y += cam_speed;
-    if (keys['q'] || keys['Q']) cam_y -= cam_speed;
+    if (control_mode == 0) {
+        if (keys['w'] || keys['W']) { cam_x += fx * cam_speed; cam_z += fz * cam_speed; }
+        if (keys['s'] || keys['S']) { cam_x -= fx * cam_speed; cam_z -= fz * cam_speed; }
+        if (keys['d'] || keys['D']) { cam_x += rx * cam_speed; cam_z += rz * cam_speed; }
+        if (keys['a'] || keys['A']) { cam_x -= rx * cam_speed; cam_z -= rz * cam_speed; }
+        if (keys['e'] || keys['E']) cam_y += cam_speed;
+        if (keys['q'] || keys['Q']) cam_y -= cam_speed;
+    } else {
+        if (keys['w'] || keys['W']) { obstacle_x += fx * obstacle_move_speed; obstacle_z += fz * obstacle_move_speed; }
+        if (keys['s'] || keys['S']) { obstacle_x -= fx * obstacle_move_speed; obstacle_z -= fz * obstacle_move_speed; }
+        if (keys['d'] || keys['D']) { obstacle_x += rx * obstacle_move_speed; obstacle_z += rz * obstacle_move_speed; }
+        if (keys['a'] || keys['A']) { obstacle_x -= rx * obstacle_move_speed; obstacle_z -= rz * obstacle_move_speed; }
+        if (keys['e'] || keys['E']) obstacle_y += obstacle_move_speed;
+        if (keys['q'] || keys['Q']) obstacle_y -= obstacle_move_speed;
+        clamp_obstacle_position();
+    }
 }
 
 static void draw_text(float x, float y, const char *str) {
@@ -393,259 +612,222 @@ static void draw_text(float x, float y, const char *str) {
 
 static void apply_camera_3d(void) {
     float aspect = (win_y > 0) ? (float)win_x / (float)win_y : 1.0f;
-    float cp = cosf(cam_pitch);
-    float fx = sinf(cam_yaw) * cp;
-    float fy = -sinf(cam_pitch);
-    float fz = -cosf(cam_yaw) * cp;
+    float forward[3], right[3], up[3];
+    camera_basis(forward, right, up);
 
+    glViewport(0, 0, win_x > 0 ? win_x : 1, win_y > 0 ? win_y : 1);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    gluPerspective(58.0, aspect, 0.03, 30.0);
+    gluPerspective(camera_fov_degrees, aspect, camera_near_clip, camera_far_clip);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     gluLookAt(cam_x, cam_y, cam_z,
-              cam_x + fx, cam_y + fy, cam_z + fz,
-              0.0, 1.0, 0.0);
+              cam_x + forward[0], cam_y + forward[1], cam_z + forward[2],
+              up[0], up[1], up[2]);
 }
 
-static void draw_cube_bounds(void) {
-    glDisable(GL_BLEND);
-    glLineWidth(1.5f);
-    glColor3f(0.28f, 0.34f, 0.40f);
-
-    glBegin(GL_LINE_LOOP);
-    glVertex3f(-0.5f, -0.5f, -0.5f); glVertex3f(0.5f, -0.5f, -0.5f);
-    glVertex3f(0.5f, 0.5f, -0.5f); glVertex3f(-0.5f, 0.5f, -0.5f);
-    glEnd();
-    glBegin(GL_LINE_LOOP);
-    glVertex3f(-0.5f, -0.5f, 0.5f); glVertex3f(0.5f, -0.5f, 0.5f);
-    glVertex3f(0.5f, 0.5f, 0.5f); glVertex3f(-0.5f, 0.5f, 0.5f);
-    glEnd();
-    glBegin(GL_LINES);
-    glVertex3f(-0.5f, -0.5f, -0.5f); glVertex3f(-0.5f, -0.5f, 0.5f);
-    glVertex3f(0.5f, -0.5f, -0.5f); glVertex3f(0.5f, -0.5f, 0.5f);
-    glVertex3f(0.5f, 0.5f, -0.5f); glVertex3f(0.5f, 0.5f, 0.5f);
-    glVertex3f(-0.5f, 0.5f, -0.5f); glVertex3f(-0.5f, 0.5f, 0.5f);
-    glEnd();
-
-    glLineWidth(2.0f);
-    glBegin(GL_LINES);
-    glColor3f(1.0f, 0.25f, 0.20f);
-    glVertex3f(-0.58f, -0.58f, -0.58f); glVertex3f(-0.38f, -0.58f, -0.58f);
-    glColor3f(0.35f, 1.0f, 0.35f);
-    glVertex3f(-0.58f, -0.58f, -0.58f); glVertex3f(-0.58f, -0.38f, -0.58f);
-    glColor3f(0.35f, 0.55f, 1.0f);
-    glVertex3f(-0.58f, -0.58f, -0.58f); glVertex3f(-0.58f, -0.58f, -0.38f);
-    glEnd();
-    glLineWidth(1.0f);
-}
-
-static void draw_input_plane_guide(void) {
-    float forward[3], right[3], up[3];
-    camera_basis(forward, right, up);
-    float center[3];
-    camera_plane_center(center);
-    float s = 0.72f;
-
-    glDisable(GL_BLEND);
-    glLineWidth(1.0f);
-    glColor3f(0.42f, 0.48f, 0.56f);
-    glBegin(GL_LINE_LOOP);
-    glVertex3f(center[0] + (-right[0] - up[0]) * s,
-               center[1] + (-right[1] - up[1]) * s,
-               center[2] + (-right[2] - up[2]) * s);
-    glVertex3f(center[0] + ( right[0] - up[0]) * s,
-               center[1] + ( right[1] - up[1]) * s,
-               center[2] + ( right[2] - up[2]) * s);
-    glVertex3f(center[0] + ( right[0] + up[0]) * s,
-               center[1] + ( right[1] + up[1]) * s,
-               center[2] + ( right[2] + up[2]) * s);
-    glVertex3f(center[0] + (-right[0] + up[0]) * s,
-               center[1] + (-right[1] + up[1]) * s,
-               center[2] + (-right[2] + up[2]) * s);
-    glEnd();
-
-    if (has_inject_pos) {
-        float m = 0.035f;
-        glLineWidth(2.0f);
-        glColor3f(1.0f, 0.95f, 0.25f);
-        glBegin(GL_LINES);
-        glVertex3f(last_inject_pos[0] - right[0] * m, last_inject_pos[1] - right[1] * m, last_inject_pos[2] - right[2] * m);
-        glVertex3f(last_inject_pos[0] + right[0] * m, last_inject_pos[1] + right[1] * m, last_inject_pos[2] + right[2] * m);
-        glVertex3f(last_inject_pos[0] - up[0] * m, last_inject_pos[1] - up[1] * m, last_inject_pos[2] - up[2] * m);
-        glVertex3f(last_inject_pos[0] + up[0] * m, last_inject_pos[1] + up[1] * m, last_inject_pos[2] + up[2] * m);
-        glEnd();
-    }
-}
-
-static float cell_coord(int index) {
-    return ((float)index - 0.5f) / (float)N - 0.5f;
-}
-
-static void draw_oriented_density_plane(float offset,
-                                        float alpha_scale,
-                                        int draw_samples,
-                                        int draw_border) {
-    float forward[3], right[3], up[3], center[3];
-    camera_basis(forward, right, up);
-    camera_plane_center(center);
-    center[0] += forward[0] * offset;
-    center[1] += forward[1] * offset;
-    center[2] += forward[2] * offset;
-
-    if (draw_samples) {
-        int samples = (N > 96) ? 64 : N;
-        float h = 1.0f / (float)samples;
-
-        glBegin(GL_QUADS);
-        for (int j = 0; j < samples; j++) {
-            float y0 = (float)j * h - 0.5f;
-            float y1 = y0 + h;
-            for (int i = 0; i < samples; i++) {
-                float x0 = (float)i * h - 0.5f;
-                float x1 = x0 + h;
-                float px[4] = {x0, x1, x1, x0};
-                float py[4] = {y0, y0, y1, y1};
-                for (int c = 0; c < 4; c++) {
-                    float wx = center[0] + right[0] * px[c] + up[0] * py[c];
-                    float wy = center[1] + right[1] * px[c] + up[1] * py[c];
-                    float wz = center[2] + right[2] * px[c] + up[2] * py[c];
-                    if (wx < -0.5f || wx > 0.5f ||
-                        wy < -0.5f || wy > 0.5f ||
-                        wz < -0.5f || wz > 0.5f) {
-                        glColor4f(0.0f, 0.0f, 0.0f, 0.0f);
-                    } else {
-                        int ci = world_to_cell(wx);
-                        int cj = world_to_cell(wy);
-                        int ck = world_to_cell(wz);
-                        int idx = IX3(ci, cj, ck);
-                        set_smoke_color(h_dens[idx], h_u[idx], h_v[idx], h_w[idx], alpha_scale);
-                    }
-                    glVertex3f(wx, wy, wz);
-                }
-            }
-        }
-        glEnd();
-    }
-
-    if (draw_border) {
-        glDisable(GL_BLEND);
-        glLineWidth(1.5f);
-        glColor3f(0.90f, 0.92f, 0.95f);
-        glBegin(GL_LINE_LOOP);
-        glVertex3f(center[0] + (-right[0] - up[0]) * 0.5f,
-                   center[1] + (-right[1] - up[1]) * 0.5f,
-                   center[2] + (-right[2] - up[2]) * 0.5f);
-        glVertex3f(center[0] + ( right[0] - up[0]) * 0.5f,
-                   center[1] + ( right[1] - up[1]) * 0.5f,
-                   center[2] + ( right[2] - up[2]) * 0.5f);
-        glVertex3f(center[0] + ( right[0] + up[0]) * 0.5f,
-                   center[1] + ( right[1] + up[1]) * 0.5f,
-                   center[2] + ( right[2] + up[2]) * 0.5f);
-        glVertex3f(center[0] + (-right[0] + up[0]) * 0.5f,
-                   center[1] + (-right[1] + up[1]) * 0.5f,
-                   center[2] + (-right[2] + up[2]) * 0.5f);
-        glEnd();
-        glLineWidth(1.0f);
-        glEnable(GL_BLEND);
-    }
-}
-
-static void draw_volume_slices(void) {
+static void draw_raymarched_volume(void) {
     if (!show_volume) return;
+    ensure_volume_render_target();
 
-    int slices = (N > 80) ? 44 : 36;
-    float step = 1.15f / (float)(slices - 1);
+    float forward_arr[3], right_arr[3], up_arr[3];
+    camera_basis(forward_arr, right_arr, up_arr);
+    float3 cam_pos = make_float3(cam_x, cam_y, cam_z);
+    float3 forward = make_float3(forward_arr[0], forward_arr[1], forward_arr[2]);
+    float3 right = make_float3(right_arr[0], right_arr[1], right_arr[2]);
+    float3 up = make_float3(up_arr[0], up_arr[1], up_arr[2]);
+    float3 obstacle_center = make_float3(obstacle_x, obstacle_y, obstacle_z);
+    float aspect = (volume_tex_h > 0) ? (float)volume_tex_w / (float)volume_tex_h : 1.0f;
+    float fov = camera_fov_degrees * 3.14159265f / 180.0f;
 
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    for (int s = slices - 1; s >= 0; s--) {
-        float offset = -0.575f + step * (float)s;
-        draw_oriented_density_plane(offset, 0.055f, 1, 0);
-    }
-    glDisable(GL_BLEND);
-}
+    dim3 threads(16, 16);
+    dim3 blocks((volume_tex_w + 15) / 16, (volume_tex_h + 15) / 16);
+    raymarch_volume_kernel<<<blocks, threads>>>(N, d_dens, d_u, d_v, d_w,
+                                                d_volume_pixels,
+                                                volume_tex_w, volume_tex_h,
+                                                cam_pos, forward, right, up,
+                                                tanf(fov * 0.5f), aspect,
+                                                domain_half_extent,
+                                                color_speed_scale,
+                                                obstacle_center,
+                                                obstacle_radius_world);
+    CUDA_CHECK(cudaPeekAtLastError());
+    CUDA_CHECK(cudaMemcpy(h_volume_pixels, d_volume_pixels,
+                          (size_t)volume_tex_w * volume_tex_h * 4,
+                          cudaMemcpyDeviceToHost));
 
-static void draw_slice_plane(void) {
-    if (!show_slice) return;
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    draw_oriented_density_plane(0.0f, 0.26f, 1, 1);
-    glDisable(GL_BLEND);
-}
+    glBindTexture(GL_TEXTURE_2D, volume_tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, volume_tex_w, volume_tex_h,
+                    GL_RGBA, GL_UNSIGNED_BYTE, h_volume_pixels);
 
-static void draw_vector_field_3d(void) {
-    if (!show_vectors) return;
-    int stride = N / 8;
-    if (stride < 5) stride = 5;
-    float spacing = (float)stride / (float)N;
-
-    glLineWidth(2.0f);
-    glBegin(GL_LINES);
-    for (int k = stride / 2 + 1; k <= N; k += stride) {
-        for (int j = stride / 2 + 1; j <= N; j += stride) {
-            for (int i = stride / 2 + 1; i <= N; i += stride) {
-                int idx = IX3(i, j, k);
-                float vx = h_u[idx], vy = h_v[idx], vz = h_w[idx];
-                float speed = sqrtf(vx * vx + vy * vy + vz * vz);
-                if (speed < 0.0002f) continue;
-                float mag = 1.0f - expf(-speed * 0.7f);
-                float len = spacing * (0.20f + 0.85f * mag);
-                float inv = 1.0f / speed;
-                float x = cell_coord(i), y = cell_coord(j), z = cell_coord(k);
-                float ex = x + vx * inv * len;
-                float ey = y + vy * inv * len;
-                float ez = z + vz * inv * len;
-                glColor3f(0.10f + 0.90f * mag,
-                          0.85f + 0.15f * mag,
-                          1.00f - 0.65f * mag);
-                glVertex3f(x, y, z);
-                glVertex3f(ex, ey, ez);
-            }
-        }
-    }
-    glEnd();
-    glLineWidth(1.0f);
-}
-
-static void display(void) {
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    apply_camera_3d();
-    glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
-
-    draw_cube_bounds();
-    draw_input_plane_guide();
-    draw_vector_field_3d();
-
+    glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
-    glDisable(GL_DEPTH_TEST);
-    draw_volume_slices();
-    glEnable(GL_DEPTH_TEST);
-    draw_slice_plane();
-    glDepthMask(GL_TRUE);
-    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, volume_tex);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
 
+    glViewport(0, 0, win_x > 0 ? win_x : 1, win_y > 0 ? win_y : 1);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     gluOrtho2D(0.0, 1.0, 0.0, 1.0);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
 
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, 0.0f);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 0.0f);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, 1.0f);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, 1.0f);
+    glEnd();
+
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_TRUE);
+}
+
+static void draw_cube_bounds(void) {
+    float h = domain_half_extent;
+    glDisable(GL_BLEND);
+    glLineWidth(1.5f);
+    glColor3f(0.28f, 0.34f, 0.40f);
+
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(-h, -h, -h); glVertex3f(h, -h, -h);
+    glVertex3f(h, h, -h); glVertex3f(-h, h, -h);
+    glEnd();
+    glBegin(GL_LINE_LOOP);
+    glVertex3f(-h, -h, h); glVertex3f(h, -h, h);
+    glVertex3f(h, h, h); glVertex3f(-h, h, h);
+    glEnd();
+    glBegin(GL_LINES);
+    glVertex3f(-h, -h, -h); glVertex3f(-h, -h, h);
+    glVertex3f(h, -h, -h); glVertex3f(h, -h, h);
+    glVertex3f(h, h, -h); glVertex3f(h, h, h);
+    glVertex3f(-h, h, -h); glVertex3f(-h, h, h);
+    glEnd();
+
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+    float axis_o = -h * 1.16f;
+    float axis_l = h * 0.34f;
+    glColor3f(1.0f, 0.25f, 0.20f);
+    glVertex3f(axis_o, axis_o, axis_o); glVertex3f(axis_o + axis_l, axis_o, axis_o);
+    glColor3f(0.35f, 1.0f, 0.35f);
+    glVertex3f(axis_o, axis_o, axis_o); glVertex3f(axis_o, axis_o + axis_l, axis_o);
+    glColor3f(0.35f, 0.55f, 1.0f);
+    glVertex3f(axis_o, axis_o, axis_o); glVertex3f(axis_o, axis_o, axis_o + axis_l);
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+static void draw_wind_source_marker(void) {
+    float center[3], dir[3], tangent[3], bitangent[3];
+    wind_source_frame(center, dir, tangent, bitangent);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glLineWidth(2.0f);
+    glColor3f(0.10f, 0.85f, 1.0f);
+
+    glBegin(GL_LINE_LOOP);
+    for (int s = 0; s < 48; s++) {
+        float a = 2.0f * pi_f * (float)s / 48.0f;
+        float side = cosf(a) * wind_source_radius_world;
+        float lift = sinf(a) * wind_source_radius_world;
+        glVertex3f(center[0] + tangent[0] * side + bitangent[0] * lift,
+                   center[1] + tangent[1] * side + bitangent[1] * lift,
+                   center[2] + tangent[2] * side + bitangent[2] * lift);
+    }
+    glEnd();
+
+    glBegin(GL_LINES);
+    float tip[3] = {
+        center[0] + dir[0] * 0.46f,
+        center[1] + dir[1] * 0.46f,
+        center[2] + dir[2] * 0.46f
+    };
+    float head_a[3] = {
+        center[0] + dir[0] * 0.34f + tangent[0] * 0.08f + bitangent[0] * 0.05f,
+        center[1] + dir[1] * 0.34f + tangent[1] * 0.08f + bitangent[1] * 0.05f,
+        center[2] + dir[2] * 0.34f + tangent[2] * 0.08f + bitangent[2] * 0.05f
+    };
+    float head_b[3] = {
+        center[0] + dir[0] * 0.34f - tangent[0] * 0.08f - bitangent[0] * 0.05f,
+        center[1] + dir[1] * 0.34f - tangent[1] * 0.08f - bitangent[1] * 0.05f,
+        center[2] + dir[2] * 0.34f - tangent[2] * 0.08f - bitangent[2] * 0.05f
+    };
+    glVertex3f(center[0], center[1], center[2]);
+    glVertex3f(tip[0], tip[1], tip[2]);
+    glVertex3f(tip[0], tip[1], tip[2]);
+    glVertex3f(head_a[0], head_a[1], head_a[2]);
+    glVertex3f(tip[0], tip[1], tip[2]);
+    glVertex3f(head_b[0], head_b[1], head_b[2]);
+    glEnd();
+    glLineWidth(1.0f);
+}
+
+static void draw_fixed_obstacle(void) {
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glPushMatrix();
+    glTranslatef(obstacle_x, obstacle_y, obstacle_z);
+    glColor3f(0.12f, 0.14f, 0.16f);
+    glutSolidSphere(obstacle_radius_world, 36, 20);
+    glColor3f(0.55f, 0.62f, 0.70f);
+    glutWireSphere(obstacle_radius_world * 1.01f, 24, 12);
+    glPopMatrix();
+}
+
+static void display(void) {
+    glViewport(0, 0, win_x > 0 ? win_x : 1, win_y > 0 ? win_y : 1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_CULL_FACE);
+
+    apply_camera_3d();
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    draw_fixed_obstacle();
+
+    draw_raymarched_volume();
+
+    apply_camera_3d();
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    draw_cube_bounds();
+    draw_wind_source_marker();
+
+    glDepthMask(GL_TRUE);
+    glDisable(GL_DEPTH_TEST);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glViewport(0, 0, win_x > 0 ? win_x : 1, win_y > 0 ? win_y : 1);
+    gluOrtho2D(0.0, 1.0, 0.0, 1.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
     char line[256];
-    snprintf(line, sizeof(line), "3D GPU N=%d  plane=%.2f%s%s%s  %.2f ms  FPS=%.1f%s",
-             N, camera_slice_offset, show_volume ? " volume" : "",
-             show_slice ? " plane" : "", auto_source ? " auto" : "", current_ms, current_fps,
+    snprintf(line, sizeof(line), "3D Wind Tunnel N=%d  [M/Tab] Mode=%s  fixed source  box=%.2f%s%s  %.2f ms  FPS=%.1f%s",
+             N, control_mode == 0 ? "CAMERA" : "OBJECT",
+             domain_size(),
+             show_volume ? " smoke" : "", auto_source ? " flow" : "",
+             current_ms, current_fps,
              paused ? "  [PAUSED]" : "");
     draw_text(0.01f, 0.97f, line);
-    snprintf(line, sizeof(line), "LMB volumetric brush  WASD/QE move  RMB look  [] brush depth  x plane view  b volume  o auto  ESC quit");
-    draw_text(0.01f, 0.02f, line);
+    snprintf(line, sizeof(line), "WASD/QE move selected target  wheel speed  RMB look  b volume  o flow  p pause  c clear");
+    draw_text(0.01f, 0.94f, line);
 
     glutSwapBuffers();
 }
 
 static void idle(void) {
-    update_camera();
+    poll_mode_toggle_key();
+    update_controls();
     if (!paused) {
         get_from_ui();
         size_t bytes = volume_count() * sizeof(float);
@@ -655,25 +837,33 @@ static void idle(void) {
         CUDA_CHECK(cudaMemcpy(d_w_prev, h_w_prev, bytes, cudaMemcpyHostToDevice));
 
         double t0 = now_seconds();
+        float obstacle_i = world_to_cell_coord(obstacle_x);
+        float obstacle_j = world_to_cell_coord(obstacle_y);
+        float obstacle_k = world_to_cell_coord(obstacle_z);
+        float obstacle_r = obstacle_radius_cells();
         vel_step3d(N, d_u, d_v, d_w, d_u_prev, d_v_prev, d_w_prev, visc, dt);
+        apply_sphere_obstacle3d(N, d_dens, d_u, d_v, d_w,
+                                obstacle_i, obstacle_j, obstacle_k, obstacle_r);
         dens_step3d(N, d_dens, d_dens_prev, d_u, d_v, d_w, diff, dt);
+        apply_sphere_obstacle3d(N, d_dens, d_u, d_v, d_w,
+                                obstacle_i, obstacle_j, obstacle_k, obstacle_r);
         fade_fields3d(N, d_dens, d_u, d_v, d_w, dissipation, 0.992f);
+        apply_sphere_obstacle3d(N, d_dens, d_u, d_v, d_w,
+                                obstacle_i, obstacle_j, obstacle_k, obstacle_r);
         CUDA_CHECK(cudaDeviceSynchronize());
         double t1 = now_seconds();
 
         accum_time += t1 - t0;
         frame_count++;
-        CUDA_CHECK(cudaMemcpy(h_dens, d_dens, bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_u, d_u, bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_v, d_v, bytes, cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_w, d_w, bytes, cudaMemcpyDeviceToHost));
 
         double now = now_seconds();
         if (now - last_fps_time > 0.5) {
             current_ms = (accum_time / frame_count) * 1000.0;
             current_fps = frame_count / (accum_time > 0.0 ? accum_time : 1.0);
-            printf("3D N=%d plane=%.3f GPU=%.3f ms fps=%.1f cam=(%.2f %.2f %.2f)\n",
-                   N, camera_slice_offset, current_ms, current_fps, cam_x, cam_y, cam_z);
+            printf("3D wind tunnel N=%d GPU=%.3f ms fps=%.1f mode=%s obj=(%.2f %.2f %.2f)\n",
+                   N, current_ms, current_fps,
+                   control_mode == 0 ? "camera" : "object",
+                   obstacle_x, obstacle_y, obstacle_z);
             accum_time = 0.0;
             frame_count = 0;
             last_fps_time = now;
@@ -689,9 +879,8 @@ static void reshape(int w, int h) {
 }
 
 static void mouse(int button, int state, int x, int y) {
-    omx = mx = x;
-    omy = my = y;
-    if (button == GLUT_LEFT_BUTTON) mouse_down[0] = (state == GLUT_DOWN);
+    mx = x;
+    my = y;
     if (button == GLUT_RIGHT_BUTTON) {
         right_look = (state == GLUT_DOWN);
     }
@@ -712,32 +901,38 @@ static void motion(int x, int y) {
 
 static void keyboard(unsigned char key, int x, int y) {
     (void)x; (void)y;
+    if (key == 'm' || key == 'M' || key == '\t') {
+#ifndef _WIN32
+        if (!mode_toggle_down) {
+            toggle_control_mode();
+        }
+        mode_toggle_down = 1;
+#endif
+        return;
+    }
+
+    int was_down = keys[key];
     keys[key] = 1;
     switch (key) {
         case 27: free_data(); exit(0);
-        case 'p': case 'P': paused = !paused; break;
-        case 'c': case 'C': clear_data(); break;
-        case 'v': case 'V': show_vectors = !show_vectors; break;
-        case 'x': case 'X': show_slice = !show_slice; break;
-        case 'b': case 'B': show_volume = !show_volume; break;
-        case 'o': case 'O': auto_source = !auto_source; break;
-        case '[':
-            camera_slice_offset -= 1.0f / (float)N;
-            if (camera_slice_offset < -0.5f) camera_slice_offset = -0.5f;
-            break;
-        case ']':
-            camera_slice_offset += 1.0f / (float)N;
-            if (camera_slice_offset > 0.5f) camera_slice_offset = 0.5f;
-            break;
+        case 'p': case 'P': if (!was_down) paused = !paused; break;
+        case 'c': case 'C': if (!was_down) clear_data(); break;
+        case 'b': case 'B': if (!was_down) show_volume = !show_volume; break;
+        case 'o': case 'O': if (!was_down) auto_source = !auto_source; break;
         case 'f': case 'F':
-            cam_x = 0.0f; cam_y = 0.0f; cam_z = 2.2f; cam_yaw = 0.0f; cam_pitch = 0.0f;
-            camera_slice_offset = 0.0f;
+            cam_x = 0.0f; cam_y = 0.0f; cam_z = 4.2f; cam_yaw = 0.0f; cam_pitch = 0.0f;
             break;
     }
 }
 
 static void keyboard_up(unsigned char key, int x, int y) {
     (void)x; (void)y;
+    if (key == 'm' || key == 'M' || key == '\t') {
+#ifndef _WIN32
+        mode_toggle_down = 0;
+#endif
+        return;
+    }
     keys[key] = 0;
 }
 
@@ -751,23 +946,22 @@ static void prompt_grid_size(void) {
     if (value < 16) value = 16;
     if (value > 128) value = 128;
     N = value;
-    camera_slice_offset = 0.0f;
 }
 
 int main(int argc, char **argv) {
     glutInit(&argc, argv);
-    printf("=== Stable Fluids 3D (GPU/CUDA slice viewer) ===\n");
+    printf("=== Stable Fluids 3D (GPU/CUDA wind tunnel viewer, M/Tab controls) ===\n");
     prompt_grid_size();
     printf("Grid: %d^3 interior cells, %.1f MB per scalar field\n",
            N, (double)(volume_count() * sizeof(float)) / (1024.0 * 1024.0));
-    printf("Controls: LMB volumetric brush, WASD/QE move, RMB look, [] brush depth, x plane view, b volume, o auto source, v vectors, p pause, c clear, ESC quit\n\n");
+    printf("Controls: m/tab camera-object mode, WASD/QE move selected, wheel speed, RMB look, b smoke, o flow, p pause, c clear, ESC quit\n\n");
 
     if (!allocate_data()) return 1;
     clear_data();
 
     glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
     glutInitWindowSize(win_x, win_y);
-    glutCreateWindow("Stable Fluids 3D - GPU/CUDA Volume Viewer");
+    glutCreateWindow("Stable Fluids 3D - GPU/CUDA Volume Viewer [M/Tab Controls]");
     glClearColor(0, 0, 0, 1);
 
     glutDisplayFunc(display);
@@ -777,6 +971,7 @@ int main(int argc, char **argv) {
     glutMotionFunc(motion);
     glutKeyboardFunc(keyboard);
     glutKeyboardUpFunc(keyboard_up);
+    glutIgnoreKeyRepeat(1);
     last_fps_time = now_seconds();
 
     glutMainLoop();
