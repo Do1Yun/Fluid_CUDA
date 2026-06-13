@@ -30,9 +30,39 @@ NUMERIC_COLUMNS = [
     "velocity_l2",
     "divergence_l2",
     "divergence_max",
+    "source_add_ms",
+    "diffuse_ms",
+    "project_ms",
+    "advect_ms",
+    "boundary_ms",
+    "obstacle_ms",
+    "fade_ms",
+    "other_ms",
     "speedup_vs_cpu",
     "timeout",
 ]
+
+PROFILE_COLUMNS = [
+    ("source_add_ms", "source"),
+    ("diffuse_ms", "diffuse"),
+    ("project_ms", "project"),
+    ("advect_ms", "advect"),
+    ("boundary_ms", "boundary"),
+    ("obstacle_ms", "obstacle"),
+    ("fade_ms", "fade"),
+    ("other_ms", "other"),
+]
+
+PROFILE_COLORS = {
+    "source_add_ms": "#4c78a8",
+    "diffuse_ms": "#72b7b2",
+    "project_ms": "#f58518",
+    "advect_ms": "#54a24b",
+    "boundary_ms": "#e45756",
+    "obstacle_ms": "#b279a2",
+    "fade_ms": "#ff9da6",
+    "other_ms": "#bab0ac",
+}
 
 
 def load_summary(csv_path: Path) -> pd.DataFrame:
@@ -119,6 +149,66 @@ def plot_task(summary: pd.DataFrame, task_label: str, out_path: Path) -> None:
     plt.close(fig)
 
 
+def plot_profile_breakdown(summary: pd.DataFrame, task_label: str, out_path: Path) -> bool:
+    columns = [column for column, _label in PROFILE_COLUMNS]
+    if any(column not in summary.columns for column in columns):
+        return False
+    if summary[columns].notna().sum().sum() == 0:
+        return False
+
+    modes = sorted(summary["mode"].dropna().unique())
+    if not modes:
+        return False
+
+    fig, axes = plt.subplots(
+        len(modes),
+        1,
+        figsize=(12.5, max(4.2, 3.1 * len(modes))),
+        constrained_layout=True,
+        squeeze=False,
+    )
+
+    for ax, mode in zip(axes[:, 0], modes):
+        group = summary[summary["mode"] == mode].sort_values("N")
+        x = np.arange(len(group))
+        bottom = np.zeros(len(group), dtype=float)
+
+        for column, label in PROFILE_COLUMNS:
+            values = group[column].fillna(0.0).to_numpy(dtype=float)
+            if np.all(values == 0.0):
+                continue
+            ax.bar(
+                x,
+                values,
+                bottom=bottom,
+                label=label,
+                color=PROFILE_COLORS.get(column),
+                width=0.72,
+            )
+            bottom += values
+
+        ax.plot(
+            x,
+            group["step_ms"].to_numpy(dtype=float),
+            color="#222222",
+            marker="o",
+            linewidth=1.5,
+            label="step_ms",
+        )
+        ax.set_title(mode.upper())
+        ax.set_ylabel("ms per frame")
+        ax.set_xticks(x)
+        ax.set_xticklabels([str(int(n)) for n in group["N"]])
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(frameon=False, ncol=4)
+
+    axes[-1, 0].set_xlabel("N")
+    fig.suptitle(f"Stable Fluid {task_label} Solver Pass Breakdown", fontsize=14)
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return True
+
+
 def make_summary_table(summary_2d: pd.DataFrame, summary_3d: pd.DataFrame, out_path: Path) -> None:
     rows: list[list[str]] = []
     for task_label, summary, cpu_mode, gpu_mode in [
@@ -196,6 +286,13 @@ def main() -> None:
     plot_task(summary_2d, "2D", outputs[0])
     plot_task(summary_3d, "3D", outputs[1])
     make_summary_table(summary_2d, summary_3d, outputs[2])
+
+    profile_2d = output_dir / "benchmark_scaling_2d_profile_breakdown.png"
+    profile_3d = output_dir / "benchmark_scaling_3d_profile_breakdown.png"
+    if plot_profile_breakdown(summary_2d, "2D", profile_2d):
+        outputs.append(profile_2d)
+    if plot_profile_breakdown(summary_3d, "3D", profile_3d):
+        outputs.append(profile_3d)
 
     for path in outputs:
         print(path)

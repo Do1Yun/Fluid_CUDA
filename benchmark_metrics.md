@@ -36,16 +36,27 @@ Benchmark CSV files are written under `benchmark_results/`.
 | `velocity_l2` | RMS velocity magnitude. | Scenario dependent |
 | `divergence_l2` | RMS divergence after projection. | Lower is better |
 | `divergence_max` | Maximum absolute divergence after projection. | Lower is better |
+| `source_add_ms` | Solver-side source accumulation inside `vel_step`/`dens_step`. This is separate from benchmark input preparation. | Lower is better |
+| `diffuse_ms` | Diffusion solve time inside the Stable Fluids step. | Lower is better |
+| `project_ms` | Pressure projection time, including divergence/pressure/update passes. | Lower is better |
+| `advect_ms` | Semi-Lagrangian advection time. | Lower is better |
+| `boundary_ms` | Boundary-condition and solid-boundary application time. | Lower is better |
+| `obstacle_ms` | Obstacle post-processing time. It is zero for 2D benchmark presets without obstacles. | Lower is better |
+| `fade_ms` | Density/velocity dissipation pass time. | Lower is better |
+| `other_ms` | `step_ms` minus the profiled solver sections. Ideally small; large values indicate unclassified work or timing overhead. | Lower is better |
 | `speedup_vs_cpu` | CPU `total_ms` divided by this row's `total_ms`; present on summary rows. | Higher is better; `1` is CPU baseline; `NaN` if CPU timed out |
 | `timeout` | `1` if the run or summary contains an early timeout. | Lower is better |
 
 ## Notes
 
 - Use `step_ms`, `total_ms`, `mcells_per_sec`, and `ns_per_cell` for performance comparisons.
+- Use `source_add_ms`, `diffuse_ms`, `project_ms`, `advect_ms`, `boundary_ms`, `obstacle_ms`, `fade_ms`, and `other_ms` to identify which part of `step_ms` dominates.
 - Use `divergence_l2` and `divergence_max` for projection quality checks.
 - `density_sum`, `density_max`, and `velocity_l2` are not simple better/worse scores. They are regression signals: compare them against previous runs with the same task, input, grid size, frame count, and solver settings.
 - CPU and GPU solvers may not produce identical density/divergence values because the CPU paths use in-place iterative solves while GPU paths use Jacobi-style ping-pong solves.
 - Very small `N` values are usually CPU-favorable because GPU kernel launch, synchronization, and host/device transfer overhead dominate the actual stencil work. Use the scaling CSV files to find the crossover range.
+- GPU benchmark profiling intentionally synchronizes around profiled sections so that the section columns explain wall-clock `step_ms`, including launch/wait overhead. Use non-profiled external profilers such as Nsight when pure kernel elapsed time is needed.
+- If `run_scaling_benchmarks.ps1` finds an older CSV schema, it archives the previous file as `*.legacy_YYYYMMDD_HHMMSS.csv` and starts a new CSV with the current header.
 
 ## Scaling Runs
 

@@ -89,15 +89,88 @@ static double now_seconds(void) {
 #endif
 }
 
+typedef enum ProfileSection {
+    PROFILE_SOURCE_ADD = 0,
+    PROFILE_DIFFUSE,
+    PROFILE_PROJECT,
+    PROFILE_ADVECT,
+    PROFILE_BOUNDARY,
+    PROFILE_OBSTACLE,
+    PROFILE_FADE,
+    PROFILE_COUNT
+} ProfileSection;
+
+typedef struct BenchmarkProfile {
+    double source_add_ms;
+    double diffuse_ms;
+    double project_ms;
+    double advect_ms;
+    double boundary_ms;
+    double obstacle_ms;
+    double fade_ms;
+    int stack[16];
+    double stack_start[16];
+    int stack_depth;
+} BenchmarkProfile;
+
+static BenchmarkProfile *active_profile = NULL;
+
+static void reset_profile(BenchmarkProfile *profile) {
+    memset(profile, 0, sizeof(*profile));
+}
+
+static double *profile_bucket(BenchmarkProfile *profile, int section) {
+    switch (section) {
+    case PROFILE_SOURCE_ADD: return &profile->source_add_ms;
+    case PROFILE_DIFFUSE: return &profile->diffuse_ms;
+    case PROFILE_PROJECT: return &profile->project_ms;
+    case PROFILE_ADVECT: return &profile->advect_ms;
+    case PROFILE_BOUNDARY: return &profile->boundary_ms;
+    case PROFILE_OBSTACLE: return &profile->obstacle_ms;
+    case PROFILE_FADE: return &profile->fade_ms;
+    default: return NULL;
+    }
+}
+
+static void profile_begin(int section) {
+    if (!active_profile || active_profile->stack_depth >= 16) return;
+    double now = now_seconds();
+    if (active_profile->stack_depth > 0) {
+        int parent = active_profile->stack[active_profile->stack_depth - 1];
+        double *bucket = profile_bucket(active_profile, parent);
+        if (bucket) *bucket += (now - active_profile->stack_start[active_profile->stack_depth - 1]) * 1000.0;
+    }
+    active_profile->stack[active_profile->stack_depth] = section;
+    active_profile->stack_start[active_profile->stack_depth] = now;
+    active_profile->stack_depth++;
+}
+
+static void profile_end(int section) {
+    if (!active_profile || active_profile->stack_depth <= 0) return;
+    double now = now_seconds();
+    int top = active_profile->stack_depth - 1;
+    int current = active_profile->stack[top];
+    double *bucket = profile_bucket(active_profile, current);
+    if (bucket) *bucket += (now - active_profile->stack_start[top]) * 1000.0;
+    active_profile->stack_depth--;
+    if (active_profile->stack_depth > 0) {
+        active_profile->stack_start[active_profile->stack_depth - 1] = now;
+    }
+    (void)section;
+}
+
 static void add_source_cpu(float *x, const float *s, float dt) {
+    profile_begin(PROFILE_SOURCE_ADD);
     int size = (N + 2) * (N + 2);
     for (int i = 0; i < size; i++) {
         x[i] += dt * s[i];
     }
+    profile_end(PROFILE_SOURCE_ADD);
 }
 
 static void apply_solid_scalar_cpu(float *x) {
     if (!solid) return;
+    profile_begin(PROFILE_BOUNDARY);
     for (int j = 0; j < N + 2; j++) {
         for (int i = 0; i < N + 2; i++) {
             if (solid[IX(i, j)]) {
@@ -111,10 +184,12 @@ static void apply_solid_scalar_cpu(float *x) {
             }
         }
     }
+    profile_end(PROFILE_BOUNDARY);
 }
 
 static void apply_solid_velocity_cpu(float *u_, float *v_) {
     if (!solid) return;
+    profile_begin(PROFILE_BOUNDARY);
     for (int j = 0; j < N + 2; j++) {
         for (int i = 0; i < N + 2; i++) {
             int idx = IX(i, j);
@@ -129,9 +204,11 @@ static void apply_solid_velocity_cpu(float *u_, float *v_) {
             if (j < N && solid[IX(i, j + 1)] && v_[idx] > 0.0f) v_[idx] = 0.0f;
         }
     }
+    profile_end(PROFILE_BOUNDARY);
 }
 
 static void set_bnd_cpu(int b, float *x) {
+    profile_begin(PROFILE_BOUNDARY);
     for (int i = 1; i <= N; i++) {
         x[IX(0, i)]     = (b == 1) ? -x[IX(1, i)] : x[IX(1, i)];
         x[IX(N + 1, i)] = (b == 1) ? -x[IX(N, i)] : x[IX(N, i)];
@@ -142,6 +219,7 @@ static void set_bnd_cpu(int b, float *x) {
     x[IX(0, N + 1)]     = 0.5f * (x[IX(1, N + 1)] + x[IX(0, N)]);
     x[IX(N + 1, 0)]     = 0.5f * (x[IX(N, 0)]     + x[IX(N + 1, 1)]);
     x[IX(N + 1, N + 1)] = 0.5f * (x[IX(N, N + 1)] + x[IX(N + 1, N)]);
+    profile_end(PROFILE_BOUNDARY);
 }
 
 static void lin_solve_cpu(int b, float *x, const float *x0, float a, float c) {
@@ -158,8 +236,10 @@ static void lin_solve_cpu(int b, float *x, const float *x0, float a, float c) {
 }
 
 static void diffuse_cpu(int b, float *x, const float *x0, float diff, float dt) {
+    profile_begin(PROFILE_DIFFUSE);
     float a = dt * diff * N * N;
     lin_solve_cpu(b, x, x0, a, 1.0f + 4.0f * a);
+    profile_end(PROFILE_DIFFUSE);
 }
 
 static float sample_fluid_bilinear_cpu(const float *field,
@@ -187,6 +267,7 @@ static float sample_fluid_bilinear_cpu(const float *field,
 }
 
 static void advect_cpu(int b, float *d, const float *d0, const float *u, const float *v, float dt) {
+    profile_begin(PROFILE_ADVECT);
     float dt0 = dt * N;
     for (int i = 1; i <= N; i++) {
         for (int j = 1; j <= N; j++) {
@@ -214,9 +295,11 @@ static void advect_cpu(int b, float *d, const float *d0, const float *u, const f
         }
     }
     set_bnd_cpu(b, d);
+    profile_end(PROFILE_ADVECT);
 }
 
 static void project_cpu(float *u, float *v, float *p, float *div) {
+    profile_begin(PROFILE_PROJECT);
     for (int i = 1; i <= N; i++) {
         for (int j = 1; j <= N; j++) {
             int idx = IX(i, j);
@@ -259,6 +342,7 @@ static void project_cpu(float *u, float *v, float *p, float *div) {
     }
     set_bnd_cpu(1, u);
     set_bnd_cpu(2, v);
+    profile_end(PROFILE_PROJECT);
 }
 
 static void dens_step_cpu(float *x, float *x0, float *u, float *v, float diff, float dt) {
@@ -293,6 +377,7 @@ static void vel_step_cpu(float *u, float *v, float *u0, float *v0, float visc, f
 }
 
 static void fade_fields_cpu(float *dens, float *u, float *v, float dissipation, float vel_damping) {
+    profile_begin(PROFILE_FADE);
     int size = (N + 2) * (N + 2);
     for (int i = 0; i < size; i++) {
         dens[i] *= dissipation;
@@ -301,6 +386,7 @@ static void fade_fields_cpu(float *dens, float *u, float *v, float dissipation, 
     }
     apply_solid_scalar_cpu(dens);
     apply_solid_velocity_cpu(u, v);
+    profile_end(PROFILE_FADE);
 }
 
 static void clear_data(void) {
@@ -900,7 +986,15 @@ static void write_benchmark_csv_cpu(const char *mode,
                                     float density_max,
                                     double velocity_l2,
                                     double divergence_l2,
-                                    float divergence_max) {
+                                    float divergence_max,
+                                    double source_add_ms,
+                                    double diffuse_ms,
+                                    double project_ms,
+                                    double advect_ms,
+                                    double boundary_ms,
+                                    double obstacle_ms,
+                                    double fade_ms,
+                                    double other_ms) {
     char timestamp[32];
     const char *filename = (strcmp(tag, "scaling") == 0) ?
         "benchmark_scaling_2d.csv" : "benchmark_2d.csv";
@@ -948,9 +1042,20 @@ static void write_benchmark_csv_cpu(const char *mode,
     int need_header = 1;
     FILE *probe = _wfopen(csv_path, L"rb");
     if (probe) {
+        char first_line[1024] = {0};
+        int has_header = (fgets(first_line, sizeof(first_line), probe) != NULL);
         fseek(probe, 0, SEEK_END);
-        need_header = (ftell(probe) == 0);
+        long file_size = ftell(probe);
+        int stale_header = has_header && strstr(first_line, "source_add_ms") == NULL;
+        need_header = (file_size == 0) || stale_header;
         fclose(probe);
+        if (stale_header) {
+            wchar_t wide_timestamp[32];
+            wchar_t legacy_path[MAX_PATH];
+            MultiByteToWideChar(CP_UTF8, 0, timestamp, -1, wide_timestamp, 32);
+            swprintf(legacy_path, MAX_PATH, L"%ls\\%ls.legacy_%ls", folder, wide_filename, wide_timestamp);
+            _wrename(csv_path, legacy_path);
+        }
     }
     FILE *fp = _wfopen(csv_path, L"ab");
 #else
@@ -964,9 +1069,18 @@ static void write_benchmark_csv_cpu(const char *mode,
     int need_header = 1;
     FILE *probe = fopen(csv_path, "rb");
     if (probe) {
+        char first_line[1024] = {0};
+        int has_header = (fgets(first_line, sizeof(first_line), probe) != NULL);
         fseek(probe, 0, SEEK_END);
-        need_header = (ftell(probe) == 0);
+        long file_size = ftell(probe);
+        int stale_header = has_header && strstr(first_line, "source_add_ms") == NULL;
+        need_header = (file_size == 0) || stale_header;
         fclose(probe);
+        if (stale_header) {
+            char legacy_path[512];
+            snprintf(legacy_path, sizeof(legacy_path), "%s/%s.legacy_%s", folder, filename, timestamp);
+            rename(csv_path, legacy_path);
+        }
     }
     FILE *fp = fopen(csv_path, "ab");
 #endif
@@ -976,15 +1090,17 @@ static void write_benchmark_csv_cpu(const char *mode,
     }
 
     if (need_header) {
-        fprintf(fp, "timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
+        fprintf(fp, "timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,source_add_ms,diffuse_ms,project_ms,advect_ms,boundary_ms,obstacle_ms,fade_ms,other_ms\n");
     }
-    fprintf(fp, "%s,2d,%s,%s,%d,2,%lld,%.6f,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+    fprintf(fp, "%s,2d,%s,%s,%d,2,%lld,%.6f,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             timestamp, mode, input_id, grid_size, cells, scalar_field_mb,
             warmup_frames, measured_frames,
             source_ms, step_ms, total_ms, fps,
             mcells_per_sec, ns_per_cell,
             density_sum, density_max, velocity_l2,
-            divergence_l2, divergence_max);
+            divergence_l2, divergence_max,
+            source_add_ms, diffuse_ms, project_ms, advect_ms,
+            boundary_ms, obstacle_ms, fade_ms, other_ms);
     fclose(fp);
 
     printf("benchmark_csv,benchmark_results/%s\n", filename);
@@ -1003,21 +1119,34 @@ static int run_benchmark_cpu(const BenchmarkConfig *cfg) {
     int total_frames = cfg->warmup + cfg->frames;
     double source_seconds = 0.0;
     double step_seconds = 0.0;
+    BenchmarkProfile profile_sum;
+    reset_profile(&profile_sum);
 
     for (int frame = 0; frame < total_frames; frame++) {
         double source_t0 = now_seconds();
         prepare_benchmark_sources_cpu(frame);
         double source_t1 = now_seconds();
 
+        BenchmarkProfile frame_profile;
+        reset_profile(&frame_profile);
+        active_profile = &frame_profile;
         double step_t0 = now_seconds();
         vel_step_cpu(u, v, u_prev, v_prev, visc, dt);
         dens_step_cpu(dens, dens_prev, u, v, diff, dt);
         fade_fields_cpu(dens, u, v, dissipation, 0.99f);
         double step_t1 = now_seconds();
+        active_profile = NULL;
 
         if (frame >= cfg->warmup) {
             source_seconds += source_t1 - source_t0;
             step_seconds += step_t1 - step_t0;
+            profile_sum.source_add_ms += frame_profile.source_add_ms;
+            profile_sum.diffuse_ms += frame_profile.diffuse_ms;
+            profile_sum.project_ms += frame_profile.project_ms;
+            profile_sum.advect_ms += frame_profile.advect_ms;
+            profile_sum.boundary_ms += frame_profile.boundary_ms;
+            profile_sum.obstacle_ms += frame_profile.obstacle_ms;
+            profile_sum.fade_ms += frame_profile.fade_ms;
         }
     }
 
@@ -1034,19 +1163,35 @@ static int run_benchmark_cpu(const BenchmarkConfig *cfg) {
     double step_ms = step_seconds * 1000.0 / (double)cfg->frames;
     double total_ms = source_ms + step_ms;
     double fps = (total_ms > 0.0) ? 1000.0 / total_ms : 0.0;
+    double inv_frames = 1.0 / (double)cfg->frames;
+    double source_add_ms = profile_sum.source_add_ms * inv_frames;
+    double diffuse_ms = profile_sum.diffuse_ms * inv_frames;
+    double project_ms = profile_sum.project_ms * inv_frames;
+    double advect_ms = profile_sum.advect_ms * inv_frames;
+    double boundary_ms = profile_sum.boundary_ms * inv_frames;
+    double obstacle_ms = profile_sum.obstacle_ms * inv_frames;
+    double fade_ms = profile_sum.fade_ms * inv_frames;
+    double accounted_ms = source_add_ms + diffuse_ms + project_ms + advect_ms +
+                          boundary_ms + obstacle_ms + fade_ms;
+    double other_ms = step_ms - accounted_ms;
 
-    printf("benchmark_header,mode,N,warmup,frames,source_ms,step_ms,total_ms,fps,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
-    printf("benchmark_result,cpu2d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+    printf("benchmark_header,mode,N,warmup,frames,source_ms,step_ms,total_ms,fps,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,source_add_ms,diffuse_ms,project_ms,advect_ms,boundary_ms,obstacle_ms,fade_ms,other_ms\n");
+    printf("benchmark_result,cpu2d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
            N, cfg->warmup, cfg->frames,
            source_ms, step_ms, total_ms, fps,
            density_sum, density_max, velocity_l2,
-           divergence_l2, divergence_max);
+           divergence_l2, divergence_max,
+           source_add_ms, diffuse_ms, project_ms, advect_ms,
+           boundary_ms, obstacle_ms, fade_ms, other_ms);
     if (cfg->save_csv) {
         write_benchmark_csv_cpu("cpu2d", "deterministic_2d_v1",
                                 cfg->tag, N, cfg->warmup, cfg->frames,
                                 source_ms, step_ms, total_ms, fps,
                                 density_sum, density_max, velocity_l2,
-                                divergence_l2, divergence_max);
+                                divergence_l2, divergence_max,
+                                source_add_ms, diffuse_ms, project_ms,
+                                advect_ms, boundary_ms, obstacle_ms,
+                                fade_ms, other_ms);
     }
 
     free_data();

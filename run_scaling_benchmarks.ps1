@@ -79,6 +79,14 @@ function New-NanRow($task, $mode, $inputId, $n, $dimension, $cells, $fieldMb, $w
         velocity_l2 = [double]::NaN
         divergence_l2 = [double]::NaN
         divergence_max = [double]::NaN
+        source_add_ms = [double]::NaN
+        diffuse_ms = [double]::NaN
+        project_ms = [double]::NaN
+        advect_ms = [double]::NaN
+        boundary_ms = [double]::NaN
+        obstacle_ms = [double]::NaN
+        fade_ms = [double]::NaN
+        other_ms = [double]::NaN
         speedup_vs_cpu = [double]::NaN
         timeout = $timeout
     }
@@ -135,6 +143,14 @@ function Invoke-BenchmarkProcess($dir, $exe, $argsList, $timeoutSec, $task, $mod
     $velocityL2 = [double]::Parse($parts[11], $culture)
     $divergenceL2 = [double]::Parse($parts[12], $culture)
     $divergenceMax = [double]::Parse($parts[13], $culture)
+    $sourceAddMs = if ($parts.Count -gt 14) { [double]::Parse($parts[14], $culture) } else { [double]::NaN }
+    $diffuseMs = if ($parts.Count -gt 15) { [double]::Parse($parts[15], $culture) } else { [double]::NaN }
+    $projectMs = if ($parts.Count -gt 16) { [double]::Parse($parts[16], $culture) } else { [double]::NaN }
+    $advectMs = if ($parts.Count -gt 17) { [double]::Parse($parts[17], $culture) } else { [double]::NaN }
+    $boundaryMs = if ($parts.Count -gt 18) { [double]::Parse($parts[18], $culture) } else { [double]::NaN }
+    $obstacleMs = if ($parts.Count -gt 19) { [double]::Parse($parts[19], $culture) } else { [double]::NaN }
+    $fadeMs = if ($parts.Count -gt 20) { [double]::Parse($parts[20], $culture) } else { [double]::NaN }
+    $otherMs = if ($parts.Count -gt 21) { [double]::Parse($parts[21], $culture) } else { [double]::NaN }
     $mcells = if ($totalMs -gt 0.0) { ([double]$cells / ($totalMs / 1000.0)) / 1000000.0 } else { [double]::NaN }
     $nsPerCell = if ($cells -gt 0) { $totalMs * 1000000.0 / [double]$cells } else { [double]::NaN }
 
@@ -162,6 +178,14 @@ function Invoke-BenchmarkProcess($dir, $exe, $argsList, $timeoutSec, $task, $mod
         velocity_l2 = $velocityL2
         divergence_l2 = $divergenceL2
         divergence_max = $divergenceMax
+        source_add_ms = $sourceAddMs
+        diffuse_ms = $diffuseMs
+        project_ms = $projectMs
+        advect_ms = $advectMs
+        boundary_ms = $boundaryMs
+        obstacle_ms = $obstacleMs
+        fade_ms = $fadeMs
+        other_ms = $otherMs
         speedup_vs_cpu = [double]::NaN
         timeout = 0
     }
@@ -206,6 +230,14 @@ function New-SummaryRow($rows, $mode, $cpuTotalMs) {
         velocity_l2 = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "velocity_l2" }
         divergence_l2 = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "divergence_l2" }
         divergence_max = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "divergence_max" }
+        source_add_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "source_add_ms" }
+        diffuse_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "diffuse_ms" }
+        project_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "project_ms" }
+        advect_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "advect_ms" }
+        boundary_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "boundary_ms" }
+        obstacle_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "obstacle_ms" }
+        fade_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "fade_ms" }
+        other_ms = if ($anyTimeout) { [double]::NaN } else { Average-Field $rows "other_ms" }
         speedup_vs_cpu = $speedup
         timeout = if ($anyTimeout) { 1 } else { 0 }
     }
@@ -214,7 +246,19 @@ function New-SummaryRow($rows, $mode, $cpuTotalMs) {
 function Write-Rows($path, $rows, $append) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
     if (-not $append -and (Test-Path $path)) { Remove-Item $path -Force }
-    $header = "row_type,timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,repeat,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,speedup_vs_cpu,timeout"
+    $header = "row_type,timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,repeat,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,source_add_ms,diffuse_ms,project_ms,advect_ms,boundary_ms,obstacle_ms,fade_ms,other_ms,speedup_vs_cpu,timeout"
+    if (Test-Path $path) {
+        $existingHeader = Get-Content -Path $path -TotalCount 1
+        if ($existingHeader -ne $header) {
+            $dir = Split-Path -Parent $path
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($path)
+            $ext = [System.IO.Path]::GetExtension($path)
+            $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $legacyPath = Join-Path $dir "$name.legacy_$stamp$ext"
+            Move-Item -LiteralPath $path -Destination $legacyPath
+            Write-Warning "Existing CSV schema changed. Archived previous file to $legacyPath"
+        }
+    }
     if (-not (Test-Path $path)) { Add-Content -Path $path -Value $header }
     foreach ($r in $rows) {
         $values = @(
@@ -226,6 +270,10 @@ function Write-Rows($path, $rows, $append) {
             (Format-Value $r.ns_per_cell), (Format-Value $r.density_sum),
             (Format-Value $r.density_max), (Format-Value $r.velocity_l2),
             (Format-Value $r.divergence_l2), (Format-Value $r.divergence_max),
+            (Format-Value $r.source_add_ms), (Format-Value $r.diffuse_ms),
+            (Format-Value $r.project_ms), (Format-Value $r.advect_ms),
+            (Format-Value $r.boundary_ms), (Format-Value $r.obstacle_ms),
+            (Format-Value $r.fade_ms), (Format-Value $r.other_ms),
             (Format-Value $r.speedup_vs_cpu), $r.timeout
         )
         Add-Content -Path $path -Value ($values -join ",")

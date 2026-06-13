@@ -901,7 +901,15 @@ static void write_benchmark_csv_gpu2d(const char *mode,
                                       float density_max,
                                       double velocity_l2,
                                       double divergence_l2,
-                                      float divergence_max) {
+                                      float divergence_max,
+                                      double source_add_ms,
+                                      double diffuse_ms,
+                                      double project_ms,
+                                      double advect_ms,
+                                      double boundary_ms,
+                                      double obstacle_ms,
+                                      double fade_ms,
+                                      double other_ms) {
     char timestamp[32];
     const char *filename = (strcmp(tag, "scaling") == 0) ?
         "benchmark_scaling_2d.csv" : "benchmark_2d.csv";
@@ -949,9 +957,20 @@ static void write_benchmark_csv_gpu2d(const char *mode,
     int need_header = 1;
     FILE *probe = _wfopen(csv_path, L"rb");
     if (probe) {
+        char first_line[1024] = {0};
+        int has_header = (fgets(first_line, sizeof(first_line), probe) != NULL);
         fseek(probe, 0, SEEK_END);
-        need_header = (ftell(probe) == 0);
+        long file_size = ftell(probe);
+        int stale_header = has_header && strstr(first_line, "source_add_ms") == NULL;
+        need_header = (file_size == 0) || stale_header;
         fclose(probe);
+        if (stale_header) {
+            wchar_t wide_timestamp[32];
+            wchar_t legacy_path[MAX_PATH];
+            MultiByteToWideChar(CP_UTF8, 0, timestamp, -1, wide_timestamp, 32);
+            swprintf(legacy_path, MAX_PATH, L"%ls\\%ls.legacy_%ls", folder, wide_filename, wide_timestamp);
+            _wrename(csv_path, legacy_path);
+        }
     }
     FILE *fp = _wfopen(csv_path, L"ab");
 #else
@@ -965,9 +984,18 @@ static void write_benchmark_csv_gpu2d(const char *mode,
     int need_header = 1;
     FILE *probe = fopen(csv_path, "rb");
     if (probe) {
+        char first_line[1024] = {0};
+        int has_header = (fgets(first_line, sizeof(first_line), probe) != NULL);
         fseek(probe, 0, SEEK_END);
-        need_header = (ftell(probe) == 0);
+        long file_size = ftell(probe);
+        int stale_header = has_header && strstr(first_line, "source_add_ms") == NULL;
+        need_header = (file_size == 0) || stale_header;
         fclose(probe);
+        if (stale_header) {
+            char legacy_path[512];
+            snprintf(legacy_path, sizeof(legacy_path), "%s/%s.legacy_%s", folder, filename, timestamp);
+            rename(csv_path, legacy_path);
+        }
     }
     FILE *fp = fopen(csv_path, "ab");
 #endif
@@ -977,15 +1005,17 @@ static void write_benchmark_csv_gpu2d(const char *mode,
     }
 
     if (need_header) {
-        fprintf(fp, "timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
+        fprintf(fp, "timestamp,task,mode,input_id,N,dimension,cells,scalar_field_mb,warmup,frames,source_ms,step_ms,total_ms,fps,mcells_per_sec,ns_per_cell,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,source_add_ms,diffuse_ms,project_ms,advect_ms,boundary_ms,obstacle_ms,fade_ms,other_ms\n");
     }
-    fprintf(fp, "%s,2d,%s,%s,%d,2,%lld,%.6f,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+    fprintf(fp, "%s,2d,%s,%s,%d,2,%lld,%.6f,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6e,%.6e,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
             timestamp, mode, input_id, grid_size, cells, scalar_field_mb,
             warmup_frames, measured_frames,
             source_ms, step_ms, total_ms, fps,
             mcells_per_sec, ns_per_cell,
             density_sum, density_max, velocity_l2,
-            divergence_l2, divergence_max);
+            divergence_l2, divergence_max,
+            source_add_ms, diffuse_ms, project_ms, advect_ms,
+            boundary_ms, obstacle_ms, fade_ms, other_ms);
     fclose(fp);
 
     printf("benchmark_csv,benchmark_results/%s\n", filename);
@@ -1004,6 +1034,7 @@ static int run_benchmark_gpu2d(const BenchmarkConfig *cfg) {
     int total_frames = cfg->warmup + cfg->frames;
     double source_seconds = 0.0;
     double step_seconds = 0.0;
+    SolverProfile profile_sum = {0};
 
     for (int frame = 0; frame < total_frames; frame++) {
         double source_t0 = now_seconds();
@@ -1011,16 +1042,26 @@ static int run_benchmark_gpu2d(const BenchmarkConfig *cfg) {
         CUDA_CHECK(cudaDeviceSynchronize());
         double source_t1 = now_seconds();
 
+        SolverProfile frame_profile = {0};
+        solver_set_profile(&frame_profile);
         double step_t0 = now_seconds();
         vel_step(N, d_u, d_v, d_u_prev, d_v_prev, visc, dt, NULL);
         dens_step(N, d_dens, d_dens_prev, d_u, d_v, diff, dt, NULL);
         fade_fields(N, d_dens, d_u, d_v, dissipation, 0.99f, NULL);
         CUDA_CHECK(cudaDeviceSynchronize());
         double step_t1 = now_seconds();
+        solver_set_profile(NULL);
 
         if (frame >= cfg->warmup) {
             source_seconds += source_t1 - source_t0;
             step_seconds += step_t1 - step_t0;
+            profile_sum.source_add_ms += frame_profile.source_add_ms;
+            profile_sum.diffuse_ms += frame_profile.diffuse_ms;
+            profile_sum.project_ms += frame_profile.project_ms;
+            profile_sum.advect_ms += frame_profile.advect_ms;
+            profile_sum.boundary_ms += frame_profile.boundary_ms;
+            profile_sum.obstacle_ms += frame_profile.obstacle_ms;
+            profile_sum.fade_ms += frame_profile.fade_ms;
         }
     }
 
@@ -1037,19 +1078,35 @@ static int run_benchmark_gpu2d(const BenchmarkConfig *cfg) {
     double step_ms = step_seconds * 1000.0 / (double)cfg->frames;
     double total_ms = source_ms + step_ms;
     double fps = (total_ms > 0.0) ? 1000.0 / total_ms : 0.0;
+    double inv_frames = 1.0 / (double)cfg->frames;
+    double source_add_ms = profile_sum.source_add_ms * inv_frames;
+    double diffuse_ms = profile_sum.diffuse_ms * inv_frames;
+    double project_ms = profile_sum.project_ms * inv_frames;
+    double advect_ms = profile_sum.advect_ms * inv_frames;
+    double boundary_ms = profile_sum.boundary_ms * inv_frames;
+    double obstacle_ms = profile_sum.obstacle_ms * inv_frames;
+    double fade_ms = profile_sum.fade_ms * inv_frames;
+    double accounted_ms = source_add_ms + diffuse_ms + project_ms + advect_ms +
+                          boundary_ms + obstacle_ms + fade_ms;
+    double other_ms = step_ms - accounted_ms;
 
-    printf("benchmark_header,mode,N,warmup,frames,source_ms,step_ms,total_ms,fps,density_sum,density_max,velocity_l2,divergence_l2,divergence_max\n");
-    printf("benchmark_result,gpu2d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e\n",
+    printf("benchmark_header,mode,N,warmup,frames,source_ms,step_ms,total_ms,fps,density_sum,density_max,velocity_l2,divergence_l2,divergence_max,source_add_ms,diffuse_ms,project_ms,advect_ms,boundary_ms,obstacle_ms,fade_ms,other_ms\n");
+    printf("benchmark_result,gpu2d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.6f,%.6e,%.6e,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
            N, cfg->warmup, cfg->frames,
            source_ms, step_ms, total_ms, fps,
            density_sum, density_max, velocity_l2,
-           divergence_l2, divergence_max);
+           divergence_l2, divergence_max,
+           source_add_ms, diffuse_ms, project_ms, advect_ms,
+           boundary_ms, obstacle_ms, fade_ms, other_ms);
     if (cfg->save_csv) {
         write_benchmark_csv_gpu2d("gpu2d", "deterministic_2d_v1",
                                   cfg->tag, N, cfg->warmup, cfg->frames,
                                   source_ms, step_ms, total_ms, fps,
                                   density_sum, density_max, velocity_l2,
-                                  divergence_l2, divergence_max);
+                                  divergence_l2, divergence_max,
+                                  source_add_ms, diffuse_ms, project_ms,
+                                  advect_ms, boundary_ms, obstacle_ms,
+                                  fade_ms, other_ms);
     }
 
     free_data();

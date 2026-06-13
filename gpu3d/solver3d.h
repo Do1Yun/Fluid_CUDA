@@ -4,6 +4,18 @@
 void init_solver3d(int n);
 void free_solver3d();
 
+typedef struct SolverProfile3D {
+    double source_add_ms;
+    double diffuse_ms;
+    double project_ms;
+    double advect_ms;
+    double boundary_ms;
+    double obstacle_ms;
+    double fade_ms;
+} SolverProfile3D;
+
+void solver3d_set_profile(SolverProfile3D *profile);
+
 void dens_step3d(int n, float *d_x, float *d_x0,
                  float *d_u, float *d_v, float *d_w,
                  float diff, float dt);
